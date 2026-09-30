@@ -55,11 +55,17 @@ jobs:
       - run: pnpm build
       # pnpm pack turns workspace:* into the exact version, so the three stay in step.
       - run: pnpm -r --filter "./packages/*" exec pnpm pack --pack-destination "$RUNNER_TEMP/packages"
+      # A version already on npm is skipped, so a release that stopped halfway can be run again.
+      # 0.1.0-alpha.0 was published by hand before trusted publishing could be set up.
       - name: Publish, the browser package first because the other two depend on it
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           case "$VERSION" in *-*) TAG=next ;; *) TAG=latest ;; esac
           for name in cashsdk-web cashsdk-react cashsdk-node; do
+            if npm view "$name@$VERSION" version >/dev/null 2>&1; then
+              echo "$name@$VERSION is already on npm"
+              continue
+            fi
             npm publish "$RUNNER_TEMP/packages/$name-$VERSION.tgz" --access public --tag "$TAG"
           done
 
