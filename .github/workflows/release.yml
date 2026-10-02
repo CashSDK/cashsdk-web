@@ -1,0 +1,81 @@
+name: Release
+
+# Publishes all three packages when a version tag is pushed, for example v0.1.0-alpha.1.
+# A prerelease version goes to the `next` dist-tag and a stable one to `latest`.
+#
+# npm trusted publishing: each package's settings on npmjs.com name this repository, this
+# workflow file and the `npm` environment. No npm token is stored anywhere, and every
+# version carries a provenance statement that links it to this commit.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: The tag names the version of every package
+        run: node scripts/check-release-tag.mjs "$GITHUB_REF_NAME"
+      - run: pnpm build
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm verify
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or later.
+      - run: npm install --global npm@11
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      # pnpm pack turns workspace:* into the exact version, so the three stay in step.
+      - run: pnpm -r --filter "./packages/*" exec pnpm pack --pack-destination "$RUNNER_TEMP/packages"
+      # A version already on npm is skipped, so a release that stopped halfway can be run again.
+      # 0.1.0-alpha.0 was published by hand before trusted publishing could be set up.
+      - name: Publish, the browser package first because the other two depend on it
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "$VERSION" in *-*) TAG=next ;; *) TAG=latest ;; esac
+          for name in cashsdk-web cashsdk-react cashsdk-node; do
+            if npm view "$name@$VERSION" version >/dev/null 2>&1; then
+              echo "$name@$VERSION is already on npm"
+              continue
+            fi
+            npm publish "$RUNNER_TEMP/packages/$name-$VERSION.tgz" --access public --tag "$TAG"
+          done
+
+  installs:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: A clean project installs the published versions and verifies their signatures
+        run: node scripts/check-published.mjs "${GITHUB_REF_NAME#v}"

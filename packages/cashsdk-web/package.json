@@ -1,0 +1,58 @@
+{
+  "name": "cashsdk-web",
+  "version": "0.1.0-alpha.1",
+  "description": "CashSDK customer sessions and entitlements for web applications",
+  "author": "CashSDK <support@cashsdk.com>",
+  "homepage": "https://docs.cashsdk.com/sdk/web",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CashSDK/cashsdk-web.git",
+    "directory": "packages/cashsdk-web"
+  },
+  "bugs": {
+    "url": "https://github.com/CashSDK/cashsdk-web/issues"
+  },
+  "keywords": [
+    "cashsdk",
+    "subscriptions",
+    "entitlements",
+    "paywall",
+    "stripe",
+    "checkout",
+    "browser"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "next",
+    "provenance": true
+  }
+}
