@@ -1,0 +1,14 @@
+{
+  "name": "cashsdk-web-monorepo",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@9.15.4",
+  "engines": { "node": "^20.19.0 || >=22.12.0" },
+  "scripts": {
+    "build": "pnpm --filter cashsdk-web build && pnpm --filter cashsdk-react --filter cashsdk-node build",
+    "lint": "pnpm -r --filter \"./packages/*\" lint",
+    "test": "pnpm -r --filter \"./packages/*\" test",
+    "verify": "node scripts/verify-packages.mjs"
+  }
+}
