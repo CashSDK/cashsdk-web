@@ -12,11 +12,10 @@
 
 </div>
 
-> **Preview.** Version `0.1.0-alpha.2` is available on npm under `next`, including the extension module.
-> Compiled GitHub release archives are also available.
-> The API can still change between previews. SDK-started Stripe checkout remains disabled on the hosted service
-> until its production acceptance gates are complete. Existing merchant Stripe Checkout tracking
-> and authenticated access reads are available in preview.
+> **Generally available.** Version `1.0.0` is on npm, including the extension module. Checkout
+> started by the SDK, your own Stripe Checkout, access reads and the Stripe customer portal work
+> in Sandbox and Production. Compiled GitHub release archives are also available. Before you take
+> real payments, follow [Go live with Stripe](https://docs.cashsdk.com/sdk/go-live).
 
 | Package | Use it for |
 | --- | --- |
@@ -26,12 +25,12 @@
 | [`cashsdk-node`](packages/cashsdk-node) | Your backend: customer sessions, access checks, webhook signatures |
 
 ```sh
-npm install cashsdk-web@0.1.0-alpha.2 cashsdk-node@0.1.0-alpha.2
+npm install cashsdk-web cashsdk-node
 ```
 
-For React, also install `cashsdk-react@0.1.0-alpha.2`. All three packages carry verified
+For React, also install `cashsdk-react`. All three packages carry verified
 registry signatures and build provenance. Archives and checksums remain available in the
-[release](https://github.com/CashSDK/cashsdk-web/releases/tag/v0.1.0-alpha.2).
+[release](https://github.com/CashSDK/cashsdk-web/releases/tag/v1.0.0).
 
 ## How it fits together
 
@@ -46,8 +45,7 @@ registry signatures and build provenance. Archives and checksums remain availabl
 The full guide is at [docs.cashsdk.com/sdk/web](https://docs.cashsdk.com/sdk/web).
 `examples/web-basic` is a complete application, with sign-in, checkout and a protected resource.
 `examples/chrome-extension` bundles the extension module locally and preserves checkout attempts
-when its popup or service worker restarts. It requires the extension module in this source
-preview, included in `0.1.0-alpha.2`.
+when its popup or service worker restarts.
 
 ## Requirements
 

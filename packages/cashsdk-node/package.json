@@ -1,6 +1,6 @@
 {
   "name": "cashsdk-node",
-  "version": "0.1.0-alpha.2",
+  "version": "1.0.0",
   "description": "CashSDK server sessions and signed webhook verification",
   "author": "CashSDK <support@cashsdk.com>",
   "homepage": "https://docs.cashsdk.com/sdk/web",
@@ -42,10 +42,11 @@
     "test": "node --test test/*.test.mjs",
     "lint": "tsc -p tsconfig.json --noEmit"
   },
-  "dependencies": {
-    "cashsdk-web": "workspace:*"
+  "peerDependencies": {
+    "cashsdk-web": "workspace:^"
   },
   "devDependencies": {
+    "cashsdk-web": "workspace:*",
     "typescript": "^5.7.3",
     "@types/node": "^22.10.5"
   },

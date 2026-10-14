@@ -25,7 +25,13 @@ export interface CreateSessionInput {
 }
 export interface WebSession {
   token: string;
+  /** When the session ends, on CashSDK's clock. */
   expiresAt: string;
+  /**
+   * Seconds the session lasts from now. The browser SDK prefers it to `expiresAt`, so a
+   * device whose clock is wrong still works. Return the whole object to the browser.
+   */
+  expiresInSeconds?: number;
   customerId: string;
   environment: Environment;
   scopes: string[];
@@ -46,6 +52,47 @@ export interface BillingPortalSession {
   /** Stripe's customer portal. It expires within minutes: redirect the customer at once. */
   url: string;
 }
+
+/**
+ * A Stripe customer portal page: Stripe's own host, or the account's custom domain under
+ * `/p/session/`. HTTPS on the default port, no user name or password, a real domain name.
+ */
+function portalUrl(value: unknown): URL | null {
+  let url: URL;
+  try {
+    if (typeof value !== "string") return null;
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  const domain =
+    /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(
+      url.hostname,
+    );
+  if (
+    url.protocol !== "https:" ||
+    url.port ||
+    url.username ||
+    url.password ||
+    !domain ||
+    (url.hostname !== "billing.stripe.com" &&
+      !url.pathname.startsWith("/p/session/"))
+  )
+    return null;
+  return url;
+}
+
+/** `Retry-After` in milliseconds: delay seconds or an HTTP date. */
+function retryAfterMs(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const delay = /^\d+$/.test(value.trim())
+    ? Number(value.trim()) * 1000
+    : Date.parse(value) - Date.now();
+  return Number.isFinite(delay) ? Math.max(0, delay) : undefined;
+}
+
+const invalidCustomer = (customerId: unknown) =>
+  typeof customerId !== "string" || !customerId || customerId.length > 200;
 
 /**
  * A request that failed before a response arrived (offline, DNS, a refused or reset
@@ -143,11 +190,11 @@ export class CashSDKServer {
    * End every browser session of one customer. Call it from your sign-out handler: each
    * tab holds its own session, and the browser's own logout only revokes that tab's.
    */
-  revokeWebSessions(
+  async revokeWebSessions(
     customerId: string,
     options: { signal?: AbortSignal } = {},
   ): Promise<{ revoked: number }> {
-    if (!customerId || customerId.length > 200)
+    if (invalidCustomer(customerId))
       throw new CashSDKError("invalid_customer", "A customer ID is required");
     return this.request(
       "POST",
@@ -165,12 +212,7 @@ export class CashSDKServer {
     input: BillingPortalInput,
     options: { signal?: AbortSignal } = {},
   ): Promise<BillingPortalSession> {
-    if (
-      !input ||
-      typeof input.customerId !== "string" ||
-      !input.customerId ||
-      input.customerId.length > 200
-    )
+    if (!input || invalidCustomer(input.customerId))
       throw new CashSDKError("invalid_customer", "A customer ID is required");
     if (
       typeof input.returnUrl !== "string" ||
@@ -188,34 +230,25 @@ export class CashSDKServer {
       },
       options.signal,
     );
-    let url: URL | null = null;
-    try {
-      url = typeof session?.url === "string" ? new URL(session.url) : null;
-    } catch {
-      url = null;
-    }
+    const url = portalUrl(session?.url);
     if (
       !url ||
       session.customerId !== input.customerId ||
-      session.environment !== this.options.environment ||
-      url.protocol !== "https:" ||
-      url.hostname !== "billing.stripe.com" ||
-      url.port ||
-      url.username ||
-      url.password
+      session.environment !== this.options.environment
     )
       throw new CashSDKError(
         "invalid_response",
         "CashSDK returned an unsupported billing portal session",
       );
-    return session;
+    return { ...session, url: url.href };
   }
 
-  getEntitlements(
+  /** The customer's access right now, from the same resolver the browser SDK reads. */
+  async getEntitlements(
     customerId: string,
     options: { signal?: AbortSignal } = {},
   ): Promise<ServerEntitlements> {
-    if (!customerId || customerId.length > 200)
+    if (invalidCustomer(customerId))
       throw new CashSDKError("invalid_customer", "A customer ID is required");
     const environment =
       this.options.environment === "sandbox" ? "Sandbox" : "Production";
@@ -294,16 +327,15 @@ export class CashSDKServer {
         }),
       );
       let data: unknown;
+      let parsed = true;
       try {
         data = JSON.parse(text);
       } catch {
-        throw new CashSDKError(
-          "invalid_response",
-          "CashSDK returned an invalid response",
-          response.status,
-        );
+        parsed = false;
       }
       if (!response.ok) {
+        // The status decides whether a retry can help, so a proxy's HTML error page is as
+        // retryable as CashSDK's own JSON. A JSON body adds the code and the server's advice.
         const envelope =
           data && typeof data === "object"
             ? (data as Record<string, unknown>)
@@ -325,8 +357,15 @@ export class CashSDKServer {
             : response.status === 429 || response.status >= 500,
           response.headers.get("x-request-id") ??
             (typeof error.requestId === "string" ? error.requestId : undefined),
+          retryAfterMs(response.headers.get("retry-after")),
         );
       }
+      if (!parsed)
+        throw new CashSDKError(
+          "invalid_response",
+          "CashSDK returned an invalid response",
+          response.status,
+        );
       return data as T;
     } finally {
       clearTimeout(timer);
@@ -335,18 +374,25 @@ export class CashSDKServer {
   }
 }
 
+/** `GET /v1/customers/{id}/entitlements`, as the public API answers it. */
 export interface ServerEntitlements {
+  object: "entitlements";
+  app_user_id: string;
+  /** False for a customer this app has never seen, or one that was erased. */
+  customer_exists: boolean;
+  /** "Sandbox" or "Production". */
+  environment: string;
+  /** Highest entitlement rank held right now, 0 for none. */
+  tier: number;
+  tier_identifier: string | null;
+  /** What the customer can use right now. An entitlement that ended is not listed. */
   entitlements: {
     identifier: string;
     name: string;
+    rank: number | null;
+    /** subscription, purchase or manual_grant. */
     source: string;
-    expiresAt?: string | null;
   }[];
-  tier: number;
-  tier_identifier: string | null;
-  app_user_id: string;
-  customer_exists: boolean;
-  environment: string;
 }
 
 export interface WebhookEvent {
@@ -361,19 +407,31 @@ export interface VerifyWebhookOptions {
   maxBytes?: number;
 }
 
-/** Verify exact received bytes before parsing. Receivers still deduplicate event.id. */
+/**
+ * Verify exact received bytes before parsing. Receivers still deduplicate event.id.
+ * `invalid_signature` and `invalid_webhook` mean the request is not a genuine CashSDK
+ * webhook: answer 400. `invalid_webhook_configuration` is your own setup (no secret, or a
+ * body your framework already parsed): let it fail as a 500, so CashSDK sends it again.
+ */
 export function verifyWebhook(
   rawBody: string | Uint8Array,
   signature: string,
   options: VerifyWebhookOptions,
 ): WebhookEvent {
+  if (typeof rawBody !== "string" && !(rawBody instanceof Uint8Array))
+    throw new CashSDKError(
+      "invalid_webhook_configuration",
+      "Pass the raw request body, as a string or the exact bytes received, not a parsed object",
+    );
   const body =
     typeof rawBody === "string"
       ? Buffer.from(rawBody, "utf8")
       : Buffer.from(rawBody);
-  const maxBytes = options.maxBytes ?? 1024 * 1024;
-  const tolerance = options.toleranceSeconds ?? 300;
+  const maxBytes = options?.maxBytes ?? 1024 * 1024;
+  const tolerance = options?.toleranceSeconds ?? 300;
   if (
+    !options ||
+    !Array.isArray(options.secrets) ||
     !Number.isSafeInteger(maxBytes) ||
     maxBytes < 1 ||
     body.length > maxBytes ||

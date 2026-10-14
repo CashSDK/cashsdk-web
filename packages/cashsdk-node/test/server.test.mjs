@@ -51,6 +51,19 @@ test("expired, future, duplicated timestamps and invalid signatures fail closed"
   );
 });
 
+test("a body a framework already parsed is a configuration error, not a bad signature", () => {
+  for (const body of [{ id: "evt_1" }, undefined, null, 7])
+    assert.throws(() => verifyWebhook(body, signature("secret"), { secrets: ["secret"], now }), {
+      code: "invalid_webhook_configuration",
+    });
+  for (const options of [undefined, {}, { secrets: "secret" }])
+    assert.throws(() => verifyWebhook(raw, signature("secret"), options), {
+      code: "invalid_webhook_configuration",
+    });
+  // A string body works as well as the bytes.
+  assert.equal(verifyWebhook(raw.toString("utf8"), signature("secret"), { secrets: ["secret"], now }).id, "evt_1");
+});
+
 test("session creation binds the configured environment and sends only server credentials", async () => {
   let observed;
   const sdk = new CashSDKServer({
@@ -137,11 +150,53 @@ test("a lost connection is a retryable network_error, not a raw fetch error", as
   const garbled = new CashSDKServer({
     secretKey: "csk_sk_test_example",
     environment: "sandbox",
-    fetch: async () => new Response("not json", { status: 502 }),
+    fetch: async () => new Response("not json", { status: 200 }),
   });
   await assert.rejects(garbled.getEntitlements("user1"), {
     code: "invalid_response",
-    status: 502,
+    status: 200,
+    retryable: false,
+  });
+});
+
+test("an error page from a proxy is classified by its status, and Retry-After is kept", async () => {
+  for (const [status, headers, retryable, retryAfterMs] of [
+    [502, {}, true, undefined],
+    [503, { "Retry-After": "4" }, true, 4000],
+    [429, { "Retry-After": "12" }, true, 12000],
+    [404, {}, false, undefined],
+  ]) {
+    const sdk = new CashSDKServer({
+      secretKey: "csk_sk_test_example",
+      environment: "sandbox",
+      fetch: async () =>
+        new Response("<html><body>Bad gateway</body></html>", {
+          status,
+          headers: { "Content-Type": "text/html", ...headers },
+        }),
+    });
+    await assert.rejects(sdk.getEntitlements("user1"), (error) => {
+      assert(error instanceof CashSDKError);
+      assert.equal(error.code, `http_${status}`);
+      assert.equal(error.status, status);
+      assert.equal(error.retryable, retryable);
+      assert.equal(error.retryAfterMs, retryAfterMs);
+      return true;
+    });
+  }
+  const limited = new CashSDKServer({
+    secretKey: "csk_sk_test_example",
+    environment: "sandbox",
+    fetch: async () =>
+      Response.json(
+        { error: { code: "rate_limited", message: "Slow down", retryable: true } },
+        { status: 429, headers: { "Retry-After": new Date(Date.now() + 30000).toUTCString() } },
+      ),
+  });
+  await assert.rejects(limited.revokeWebSessions("user1"), (error) => {
+    assert.equal(error.code, "rate_limited");
+    assert(error.retryAfterMs > 25000 && error.retryAfterMs <= 30000, String(error.retryAfterMs));
+    return true;
   });
 });
 
@@ -183,10 +238,19 @@ test("sign-out ends every session of one customer in the configured environment"
     environment: "sandbox",
   });
   assert.equal(observed.headers.Authorization, "Bearer csk_rk_test_example");
-  assert.throws(() => sdk.revokeWebSessions(""), { code: "invalid_customer" });
-  assert.throws(() => sdk.revokeWebSessions("c".repeat(201)), {
-    code: "invalid_customer",
-  });
+  // Bad input rejects, like any other failure: it never throws before a promise exists.
+  for (const customerId of ["", "c".repeat(201), undefined, 7]) {
+    let returned;
+    assert.doesNotThrow(() => {
+      returned = sdk.revokeWebSessions(customerId);
+    });
+    await assert.rejects(returned, { code: "invalid_customer" });
+    let read;
+    assert.doesNotThrow(() => {
+      read = sdk.getEntitlements(customerId);
+    });
+    await assert.rejects(read, { code: "invalid_customer" });
+  }
 });
 
 test("a billing portal is opened for the named customer in the configured environment", async () => {
@@ -240,10 +304,21 @@ test("a billing portal is opened for the named customer in the configured enviro
     { code: "invalid_return_url" },
   );
   assert.equal(requests.length, 2, "invalid input sends nothing");
+  // A Stripe custom domain serves the portal under /p/session/.
+  answer = () => ({ customerId: "user_1", environment: "sandbox", provider: "stripe", url: "https://billing.merchant.example/p/session/test_2" });
+  assert.equal(
+    (await sdk.createBillingPortalSession({ customerId: "user_1", returnUrl: "https://app.example.com/account" })).url,
+    "https://billing.merchant.example/p/session/test_2",
+  );
   for (const bad of [
     (url, body) => ({ customerId: "someone_else", environment: body.environment, provider: "stripe", url: "https://billing.stripe.com/p/session/x" }),
     () => ({ customerId: "user_1", environment: "production", provider: "stripe", url: "https://billing.stripe.com/p/session/x" }),
-    () => ({ customerId: "user_1", environment: "sandbox", provider: "stripe", url: "https://evil.example/p/session/x" }),
+    () => ({ customerId: "user_1", environment: "sandbox", provider: "stripe", url: "https://evil.example/session/x" }),
+    () => ({ customerId: "user_1", environment: "sandbox", provider: "stripe", url: "https://127.0.0.1/p/session/x" }),
+    () => ({ customerId: "user_1", environment: "sandbox", provider: "stripe", url: "https://localhost/p/session/x" }),
+    () => ({ customerId: "user_1", environment: "sandbox", provider: "stripe", url: "https://billing.stripe.com:8443/p/session/x" }),
+    () => ({ customerId: "user_1", environment: "sandbox", provider: "stripe", url: "http://billing.stripe.com/p/session/x" }),
+    () => ({ customerId: "user_1", environment: "sandbox", provider: "stripe", url: "https://u:p@billing.merchant.example/p/session/x" }),
     () => ({ customerId: "user_1", environment: "sandbox", provider: "stripe", url: "not a url" }),
   ]) {
     answer = bad;
@@ -281,4 +356,22 @@ test("the server's code, retry advice and request id reach the error", async () 
       return true;
     },
   );
+});
+
+test("server entitlements have the public API's shape", async () => {
+  const body = {
+    object: "entitlements",
+    app_user_id: "user_1",
+    customer_exists: true,
+    environment: "Sandbox",
+    tier: 2,
+    tier_identifier: "pro",
+    entitlements: [{ identifier: "pro", name: "Pro", rank: 2, source: "subscription" }],
+  };
+  const sdk = new CashSDKServer({
+    secretKey: "csk_sk_test_example",
+    environment: "sandbox",
+    fetch: async () => Response.json(body),
+  });
+  assert.deepEqual(await sdk.getEntitlements("user_1"), body);
 });

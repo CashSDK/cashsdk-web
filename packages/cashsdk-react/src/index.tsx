@@ -1,24 +1,27 @@
 "use client";
 
-import type {
-  BillingPortal,
-  BillingPortalInput,
-  CashSDKClient,
-  Checkout,
-  CheckoutInput,
-  CheckoutOptions,
-  ClientSnapshot,
-  EntitlementSnapshot,
-  Offerings,
-  RequestOptions,
-  Subscriptions,
-  WebSubscription,
+import {
+  CashSDKError,
+  type BillingPortal,
+  type BillingPortalInput,
+  type CashSDKClient,
+  type Checkout,
+  type CheckoutInput,
+  type CheckoutOptions,
+  type ClientSnapshot,
+  type EntitlementSnapshot,
+  type Offerings,
+  type PurchaseInput,
+  type RequestOptions,
+  type Subscriptions,
+  type WebSubscription,
 } from "cashsdk-web";
 import {
   createContext,
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -32,6 +35,42 @@ const serverSnapshot: ClientSnapshot = Object.freeze({
   error: null,
 });
 
+/**
+ * Every hook error as a CashSDKError, so `error.code` is always there. One the SDK did not
+ * make is `unknown_error`, with the original as `cause`.
+ */
+function asCashSDKError(error: unknown, failure: string): CashSDKError {
+  if (
+    error instanceof Error &&
+    error.name === "CashSDKError" &&
+    typeof (error as { code?: unknown }).code === "string"
+  )
+    return error as CashSDKError;
+  return new CashSDKError(
+    "unknown_error",
+    error instanceof Error && error.message ? error.message : failure,
+    0,
+    false,
+    undefined,
+    undefined,
+    { cause: error },
+  );
+}
+
+/**
+ * Subscribe to a client that may already be destroyed. A destroyed client has nothing left to
+ * report, so its subscription is a no-op instead of an error thrown during render.
+ */
+function subscriber(client: CashSDKClient) {
+  return (listener: () => void) => {
+    try {
+      return client.subscribe(listener);
+    } catch {
+      return () => {};
+    }
+  };
+}
+
 /** Create the client once in the application. Its owner controls logout and destruction. */
 export function CashSDKProvider({
   client,
@@ -40,11 +79,23 @@ export function CashSDKProvider({
   client: CashSDKClient;
   children: ReactNode;
 }) {
+  const subscribe = useMemo(() => subscriber(client), [client]);
+  const status = useSyncExternalStore(
+    subscribe,
+    () => client.getSnapshot().status,
+    () => serverSnapshot.status,
+  );
   useEffect(() => {
-    void client.initialize().catch(() => {
-      /* Error is exposed in the client snapshot. */
-    });
-  }, [client]);
+    // Load the customer whenever the client is idle: on mount, and again after
+    // setSessionTokenProvider() for a new account. A signed-out or destroyed client waits for
+    // its owner. initialize() can throw synchronously, so it runs inside the promise chain.
+    if (status !== "idle") return;
+    void Promise.resolve()
+      .then(() => client.initialize())
+      .catch(() => {
+        /* Error is exposed in the client snapshot. */
+      });
+  }, [client, status]);
   return <Context.Provider value={client}>{children}</Context.Provider>;
 }
 
@@ -56,8 +107,9 @@ export function useCashSDK(): CashSDKClient {
 
 export function useCashSDKState(): ClientSnapshot {
   const client = useCashSDK();
+  const subscribe = useMemo(() => subscriber(client), [client]);
   return useSyncExternalStore(
-    client.subscribe,
+    subscribe,
     client.getSnapshot,
     () => serverSnapshot,
   );
@@ -96,7 +148,7 @@ export function useEntitlements() {
 interface Read<T> {
   data: T | null;
   status: "idle" | "loading" | "ready" | "error";
-  error: Error | null;
+  error: CashSDKError | null;
   /** Read again, for example after a purchase or a catalog change. */
   refresh: () => void;
 }
@@ -105,7 +157,7 @@ interface Loaded<T> {
   customerId: string | null;
   data: T | null;
   status: Read<T>["status"];
-  error: Error | null;
+  error: CashSDKError | null;
 }
 const notLoaded: Loaded<never> = {
   customerId: null,
@@ -152,7 +204,7 @@ function useCustomerRead<T>(
             customerId,
             data: null,
             status: "error",
-            error: error instanceof Error ? error : new Error(failure),
+            error: asCashSDKError(error, failure),
           });
       },
     );
@@ -161,11 +213,16 @@ function useCustomerRead<T>(
   }, [client, customerId, request, failure]);
   const current: Loaded<T> =
     customerId && loaded.customerId === customerId ? loaded : notLoaded;
+  const refresh = useCallback(() => setRequest((value) => value + 1), []);
+  // Nothing can be read while the client itself failed to load the customer: report its error
+  // rather than an idle read that never starts.
+  if (!customerId && state.status === "error")
+    return { data: null, status: "error", error: state.error, refresh };
   return {
     data: current.data,
     status: customerId && current === notLoaded ? "loading" : current.status,
     error: current.error,
-    refresh: useCallback(() => setRequest((value) => value + 1), []),
+    refresh,
   };
 }
 
@@ -196,70 +253,162 @@ export function useSubscriptions(): SubscriptionsResult {
   return { subscriptions: data?.subscriptions ?? [], ...rest };
 }
 
-export interface CheckoutResult {
-  checkout: Checkout | null;
-  status: "idle" | "starting" | "started" | "error";
-  error: Error | null;
-  /**
-   * Start a checkout. Call it from a click or submit handler, never from an effect or
-   * during render. Keep one idempotency key per purchase attempt and store it before the
-   * call, so a lost response is retried as the same purchase.
-   */
-  start: (input: CheckoutInput, options: CheckoutOptions) => Promise<Checkout>;
-  reset: () => void;
+type ActionStatus = "idle" | "starting" | "started" | "error";
+interface Action<T> {
+  /** The customer the result belongs to. It is never shown to the next one. */
+  owner: string | null;
+  value: T | null;
+  status: ActionStatus;
+  error: CashSDKError | null;
 }
+const idle: Action<never> = { owner: null, value: null, status: "idle", error: null };
 
-/** One checkout at a time: a second call while one is starting joins the first. */
-export function useCheckout(): CheckoutResult {
+/**
+ * One action at a time, started from a handler. A second call that `joins` the running one
+ * gets its promise; any other is refused. When the customer changes, the previous customer's
+ * result and error are dropped.
+ */
+function useAction<A extends unknown[], T>(
+  perform: (client: CashSDKClient, ...args: A) => Promise<T>,
+  failure: string,
+  joins: (running: A, next: A) => boolean,
+  ownerOf: (value: T) => string | null | undefined = () => undefined,
+) {
   const client = useCashSDK();
-  const running = useRef<Promise<Checkout> | null>(null);
-  const [state, setState] = useState<{
-    checkout: Checkout | null;
-    status: CheckoutResult["status"];
-    error: Error | null;
-  }>({ checkout: null, status: "idle", error: null });
+  const customerId = useCashSDKState().customer?.customerId ?? null;
+  const running = useRef<{ args: A; operation: Promise<T> } | null>(null);
+  // The latest arguments, without making new function identities change `start`.
+  const config = useRef({ perform, failure, joins, ownerOf });
+  config.current = { perform, failure, joins, ownerOf };
+  const [state, setState] = useState<Action<T>>(idle);
   const start = useCallback(
-    (input: CheckoutInput, options: CheckoutOptions) => {
-      if (running.current) return running.current;
-      setState({ checkout: null, status: "starting", error: null });
-      const operation = client
-        .checkout(input, options)
+    (...args: A): Promise<T> => {
+      const { perform, failure, joins, ownerOf } = config.current;
+      const current = running.current;
+      if (current) {
+        if (joins(current.args, args)) return current.operation;
+        return Promise.reject(
+          new CashSDKError(
+            "purchase_in_progress",
+            "Another purchase is starting. Try again once it has finished.",
+            0,
+            true,
+          ),
+        );
+      }
+      const owner = client.getSnapshot().customer?.customerId ?? null;
+      // Whoever the client knows once the call is over: the customer may have loaded meanwhile.
+      const settledOwner = () =>
+        client.getSnapshot().customer?.customerId ?? owner;
+      setState({ owner, value: null, status: "starting", error: null });
+      const operation = Promise.resolve()
+        .then(() => perform(client, ...args))
         .then(
-          (checkout) => {
-            setState({ checkout, status: "started", error: null });
-            return checkout;
+          (value) => {
+            setState({
+              owner: ownerOf(value) ?? settledOwner(),
+              value,
+              status: "started",
+              error: null,
+            });
+            return value;
           },
           (error: unknown) => {
             setState({
-              checkout: null,
+              owner: settledOwner(),
+              value: null,
               status: "error",
-              error:
-                error instanceof Error
-                  ? error
-                  : new Error("Could not start checkout"),
+              error: asCashSDKError(error, failure),
             });
             throw error;
           },
         )
         .finally(() => {
-          if (running.current === operation) running.current = null;
+          if (running.current?.operation === operation) running.current = null;
         });
-      running.current = operation;
+      running.current = { args, operation };
       return operation;
     },
     [client],
   );
-  const reset = useCallback(
-    () => setState({ checkout: null, status: "idle", error: null }),
-    [],
+  const reset = useCallback(() => setState(idle), []);
+  const current =
+    state.owner === customerId || state.status === "starting" ? state : idle;
+  return { current, start, reset };
+}
+
+export interface CheckoutResult {
+  checkout: Checkout | null;
+  status: ActionStatus;
+  error: CashSDKError | null;
+  /**
+   * Start a checkout with your own idempotency key. Prefer `usePurchase`, which keeps the
+   * key for you. Call it from a click or submit handler, never from an effect or during
+   * render. Keep one key per purchase attempt and store it before the call, so a lost
+   * response is retried as the same purchase.
+   */
+  start: (input: CheckoutInput, options: CheckoutOptions) => Promise<Checkout>;
+  reset: () => void;
+}
+
+/**
+ * One checkout at a time: a second call while one is starting joins the first. When the
+ * customer changes, the previous customer's checkout and error are dropped.
+ */
+export function useCheckout(): CheckoutResult {
+  const { current, start, reset } = useAction(
+    (client, input: CheckoutInput, options: CheckoutOptions) =>
+      client.checkout(input, options),
+    "Could not start checkout",
+    () => true,
+    (checkout) => checkout.customerId,
   );
-  return { ...state, start, reset };
+  return {
+    checkout: current.value,
+    status: current.status,
+    error: current.error,
+    start,
+    reset,
+  };
+}
+
+export interface PurchaseResult {
+  /** The latest purchase's checkout. Send the customer to `checkout.action.url`. */
+  checkout: Checkout | null;
+  status: ActionStatus;
+  error: CashSDKError | null;
+  /**
+   * Buy a package, as `client.purchase` does: one idempotency key per customer and package,
+   * kept for you, and a new one once an attempt is over. Call it from a click handler, never
+   * from an effect or during render. A second click for the same package joins the running
+   * purchase; one for another package is refused with `purchase_in_progress`.
+   */
+  start: (packageId: string, input: PurchaseInput) => Promise<Checkout>;
+  reset: () => void;
+}
+
+/** Sell a package. When the customer changes, the previous customer's purchase is dropped. */
+export function usePurchase(): PurchaseResult {
+  const { current, start, reset } = useAction(
+    (client, packageId: string, input: PurchaseInput) =>
+      client.purchase(packageId, input),
+    "Could not start the purchase",
+    (running, next) => running[0] === next[0],
+    (checkout) => checkout.customerId,
+  );
+  return {
+    checkout: current.value,
+    status: current.status,
+    error: current.error,
+    start,
+    reset,
+  };
 }
 
 export interface BillingPortalResult {
   portal: BillingPortal | null;
-  status: "idle" | "starting" | "started" | "error";
-  error: Error | null;
+  status: ActionStatus;
+  error: CashSDKError | null;
   /**
    * Open a Stripe customer portal session. Call it from a click handler, never from an
    * effect or during render, then send the customer to `portal.url` at once: the session
@@ -272,66 +421,19 @@ export interface BillingPortalResult {
   reset: () => void;
 }
 
-interface PortalState {
-  /** The customer the portal was opened for. A portal is never shown to the next one. */
-  owner: string | null;
-  portal: BillingPortal | null;
-  status: BillingPortalResult["status"];
-  error: Error | null;
-}
-const idlePortal: PortalState = {
-  owner: null,
-  portal: null,
-  status: "idle",
-  error: null,
-};
-
 /**
  * One portal session at a time: a second call while one is starting joins the first.
  * When the customer changes, the previous customer's portal and error are dropped.
  */
 export function useBillingPortal(): BillingPortalResult {
-  const client = useCashSDK();
-  const customerId = useCashSDKState().customer?.customerId ?? null;
-  const running = useRef<Promise<BillingPortal> | null>(null);
-  const [state, setState] = useState<PortalState>(idlePortal);
-  const start = useCallback(
-    (input: BillingPortalInput, options?: RequestOptions) => {
-      if (running.current) return running.current;
-      const owner = client.getSnapshot().customer?.customerId ?? null;
-      setState({ owner, portal: null, status: "starting", error: null });
-      const operation = client
-        .openBillingPortal(input, options)
-        .then(
-          (portal) => {
-            setState({ owner, portal, status: "started", error: null });
-            return portal;
-          },
-          (error: unknown) => {
-            setState({
-              owner,
-              portal: null,
-              status: "error",
-              error:
-                error instanceof Error
-                  ? error
-                  : new Error("Could not open the billing portal"),
-            });
-            throw error;
-          },
-        )
-        .finally(() => {
-          if (running.current === operation) running.current = null;
-        });
-      running.current = operation;
-      return operation;
-    },
-    [client],
+  const { current, start, reset } = useAction(
+    (client, input: BillingPortalInput, options?: RequestOptions) =>
+      client.openBillingPortal(input, options),
+    "Could not open the billing portal",
+    () => true,
   );
-  const reset = useCallback(() => setState(idlePortal), []);
-  const current = state.owner === customerId ? state : idlePortal;
   return {
-    portal: current.portal,
+    portal: current.value,
     status: current.status,
     error: current.error,
     start,

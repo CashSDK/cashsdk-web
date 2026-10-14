@@ -1,14 +1,34 @@
+import type { CashSDKError } from "./http.js";
+
 export type Environment = "sandbox" | "production";
 export interface RequestOptions {
   signal?: AbortSignal;
 }
+/**
+ * What `createWebSession` in `cashsdk-node` returns. Pass it on as it is: the SDK reads
+ * `expiresInSeconds` on this device's clock, so a clock that is off does not matter. A
+ * provider that returns only `expiresAt` still works.
+ */
 export interface SessionToken {
   token: string;
+  /** Seconds the session is valid for, counted from when your backend answered. */
+  expiresInSeconds?: number;
+  /** When the session ends, on the server's clock. */
   expiresAt?: string;
 }
 export type SessionTokenProvider = (options: {
   signal: AbortSignal;
 }) => Promise<string | SessionToken>;
+/**
+ * Where `purchase` keeps its attempts: one idempotency key and checkout id per customer and
+ * package. Each method may return a promise. The default is the tab's `sessionStorage`, or
+ * memory when storage is blocked. In an extension service worker, pass `chrome.storage.local`.
+ */
+export interface PurchaseStorage {
+  get(key: string): string | null | undefined | Promise<string | null | undefined>;
+  set(key: string, value: string): void | Promise<void>;
+  remove(key: string): void | Promise<void>;
+}
 export interface CashSDKOptions {
   publishableKey: string;
   environment: Environment;
@@ -16,6 +36,8 @@ export interface CashSDKOptions {
   apiUrl?: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
+  /** Where `purchase` keeps its attempts. The tab's `sessionStorage` by default. */
+  purchaseStorage?: PurchaseStorage;
 }
 export interface Customer {
   customerId: string;
@@ -57,12 +79,17 @@ export interface WebPackage {
   product: {
     identifier: string;
     displayName: string | null;
+    /** auto_renewable, non_consumable and so on. */
     type: string;
     provider: string;
     amountMinor: string | null;
     currency: string | null;
     duration: string | null;
   };
+  /**
+   * This session can start a checkout for it. False when the customer already has this
+   * plan's access or owns the one-time product.
+   */
   purchasable: boolean;
 }
 export interface Offerings {
@@ -87,6 +114,16 @@ export interface Checkout {
   id: string;
   provider: "stripe";
   environment: Environment;
+  /** The customer the checkout belongs to. Older servers leave it out. */
+  customerId?: string;
+  /** "subscription" for a recurring plan, "payment" for a one-time product. */
+  mode?: "subscription" | "payment";
+  /** The catalog product being bought. */
+  productIdentifier?: string;
+  /**
+   * A status this SDK version does not know reads as `pending`: keep the attempt and read
+   * it again.
+   */
   status:
     | "pending"
     | "requires_action"
@@ -98,6 +135,14 @@ export interface Checkout {
   accessStatus: "check_entitlements";
   action: { type: "redirect"; url: string } | null;
   expiresAt: string | null;
+}
+export interface PurchaseInput extends RequestOptions {
+  /** Where Stripe sends the customer after paying. On the session's origin, no fragment. */
+  successUrl: string;
+  /** Where Stripe sends the customer who leaves. On the session's origin, no fragment. */
+  cancelUrl: string;
+  /** Optional. Without it CashSDK uses the app's active connection for the package's provider. */
+  connectionId?: string;
 }
 export interface BillingPortalInput {
   /** Where Stripe sends the customer back. On the session's origin, with no fragment. */
@@ -113,7 +158,7 @@ export interface BillingPortal {
 export interface WaitOptions extends RequestOptions {
   /** Stop waiting after this long. 30 seconds by default, 5 minutes at most. */
   timeoutMs?: number;
-  /** Delay before the second read. It grows by half each time, up to 5 seconds. */
+  /** Delay before the second read, 1000 to 5000. It grows by half each time, up to 5 seconds. */
   intervalMs?: number;
 }
 export interface CheckoutOutcome {
@@ -129,9 +174,22 @@ export interface EntitlementOutcome {
   /** False when the wait ended before the entitlement was active. */
   active: boolean;
 }
+export interface RevocationResult {
+  /** True when CashSDK confirmed the session ended (or had already), or this client held none. */
+  revoked: boolean;
+  /** Why CashSDK could not be told, when `revoked` is false. */
+  error: CashSDKError | null;
+}
+export interface LogoutResult {
+  /**
+   * Ending this tab's session at CashSDK. It runs on its own and never rejects. Your
+   * backend's `revokeWebSessions` ends every session of the customer either way.
+   */
+  revocation: Promise<RevocationResult>;
+}
 export interface ClientSnapshot {
   status: "idle" | "loading" | "ready" | "error" | "signed_out" | "destroyed";
   customer: Customer | null;
   entitlements: EntitlementSnapshot | null;
-  error: Error | null;
+  error: CashSDKError | null;
 }

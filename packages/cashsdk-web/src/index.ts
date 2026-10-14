@@ -2,10 +2,26 @@ import {
   aborted,
   apiUrl,
   CashSDKError,
+  isCashSDKError,
   networkError,
+  responseError,
   responseJSON,
+  responseText,
+  stripePageUrl,
+  toCashSDKError,
   withAbort,
 } from "./http.js";
+import {
+  attemptKey,
+  attemptSlot,
+  clearAttempt,
+  FINAL_REFUSALS,
+  isOver,
+  readAttempt,
+  tabStorage,
+  writeAttempt,
+  type Attempt,
+} from "./purchase.js";
 import type {
   BillingPortal,
   BillingPortalInput,
@@ -18,8 +34,13 @@ import type {
   Customer,
   EntitlementOutcome,
   EntitlementSnapshot,
+  LogoutResult,
   Offerings,
+  PurchaseInput,
+  PurchaseStorage,
   RequestOptions,
+  RevocationResult,
+  SessionToken,
   SessionTokenProvider,
   Subscriptions,
   WaitOptions,
@@ -35,10 +56,80 @@ const initial = (): ClientSnapshot =>
     error: null,
   });
 
+/** The longest session CashSDK issues. A token is never reused for longer. */
+const MAX_SESSION_MS = 600_000;
+/** How long a session with no usable expiry is reused before the backend is asked again. */
+const SHORT_SESSION_MS = 60_000;
+const STATUSES = new Set<string>([
+  "pending",
+  "requires_action",
+  "complete",
+  "expired",
+  "failed",
+  "needs_review",
+]);
+
+/**
+ * When to stop reusing a session, on this device's clock. `expiresInSeconds` is relative,
+ * so a clock that is off does not matter. An absolute `expiresAt` that this clock already
+ * sees as past (a clock running ahead) is used for a short while anyway: CashSDK's 401 is
+ * what ends a session, and the SDK then asks for a new one. Null when the provider says the
+ * session has already ended.
+ */
+function sessionExpiry(result: SessionToken, receivedAt: number): number | null {
+  if (result.expiresInSeconds !== undefined && result.expiresInSeconds !== null) {
+    const seconds = result.expiresInSeconds;
+    if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0)
+      return null;
+    return receivedAt + Math.min(seconds * 1000, MAX_SESSION_MS);
+  }
+  if (result.expiresAt === undefined || result.expiresAt === null)
+    return receivedAt + SHORT_SESSION_MS;
+  const at =
+    typeof result.expiresAt === "string" ? Date.parse(result.expiresAt) : NaN;
+  if (!Number.isFinite(at)) return null;
+  const left = at - receivedAt;
+  return receivedAt + (left > 0 ? Math.min(left, MAX_SESSION_MS) : SHORT_SESSION_MS);
+}
+
+type Broadcast =
+  | { type: "signed_out"; customerId: string | null }
+  | { type: "customer_changed" };
+
+/**
+ * Tabs of one app (one publishable key and environment) tell each other about a sign-out or
+ * a change of customer, so none keeps showing access it no longer should. Only in a browser
+ * or an extension, where BroadcastChannel exists; nothing happens elsewhere.
+ */
+function openChannel(
+  name: string,
+  receive: (data: unknown) => void,
+): BroadcastChannel | null {
+  if (
+    typeof BroadcastChannel !== "function" ||
+    typeof (globalThis as { location?: unknown }).location === "undefined"
+  )
+    return null;
+  try {
+    const channel = new BroadcastChannel(name);
+    channel.onmessage = (event) => receive(event.data);
+    // A runtime with unref (Node.js) must not stay alive for a channel.
+    (channel as { unref?: () => void }).unref?.();
+    return channel;
+  } catch {
+    return null;
+  }
+}
+
+const isCode = (error: unknown, code: string) =>
+  isCashSDKError(error) && error.code === code;
+
 export class CashSDKClient {
   private readonly base: string;
   private readonly fetcher: typeof fetch;
   private readonly timeout: number;
+  private readonly storage: PurchaseStorage;
+  private readonly channel: BroadcastChannel | null;
   private provider: SessionTokenProvider;
   private token?: string;
   private tokenExpiry = 0;
@@ -46,6 +137,7 @@ export class CashSDKClient {
   private generation = new AbortController();
   private refresh?: Promise<string>;
   private initializing?: Promise<ClientSnapshot>;
+  private purchases = new Map<string, Promise<Checkout>>();
   private state = initial();
   private listeners = new Set<() => void>();
   private closed = false;
@@ -64,6 +156,18 @@ export class CashSDKClient {
         "A publishable key, explicit environment and session token provider are required",
       );
     }
+    const storage = options.purchaseStorage;
+    if (
+      storage !== undefined &&
+      (!storage ||
+        typeof storage.get !== "function" ||
+        typeof storage.set !== "function" ||
+        typeof storage.remove !== "function")
+    )
+      throw new CashSDKError(
+        "invalid_configuration",
+        "purchaseStorage needs get, set and remove",
+      );
     this.base = apiUrl(
       options.apiUrl ?? "https://api.cashsdk.com",
       options.environment === "sandbox",
@@ -80,6 +184,11 @@ export class CashSDKClient {
       );
     this.fetcher = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.provider = options.getSessionToken;
+    this.storage = storage ?? tabStorage;
+    this.channel = openChannel(
+      `cashsdk:${options.publishableKey}:${options.environment}`,
+      (data) => this.received(data),
+    );
   }
 
   getSnapshot = (): ClientSnapshot => this.state;
@@ -105,10 +214,7 @@ export class CashSDKClient {
           this.update({
             ...this.state,
             status: "error",
-            error:
-              error instanceof Error
-                ? error
-                : new Error("Initialization failed"),
+            error: toCashSDKError(error),
           });
         throw error;
       })
@@ -228,6 +334,10 @@ export class CashSDKClient {
     return result;
   }
 
+  /**
+   * A checkout with your own idempotency key. Prefer `purchase`, which keeps one key per
+   * customer and package for you and starts a new one when an attempt is over.
+   */
   async checkout(
     input: CheckoutInput,
     options: CheckoutOptions,
@@ -252,7 +362,7 @@ export class CashSDKClient {
     id: string,
     options: RequestOptions = {},
   ): Promise<Checkout> {
-    if (!/^[A-Za-z0-9_-]{1,200}$/.test(id))
+    if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,200}$/.test(id))
       throw new CashSDKError("invalid_checkout", "A checkout ID is required");
     return this.validateCheckout(
       await this.request<Checkout>(
@@ -261,6 +371,207 @@ export class CashSDKClient {
         options,
       ),
     );
+  }
+
+  /**
+   * Buy one package: start the customer's checkout for it, or pick up the one already
+   * started. Send the customer to `action.url` when the result has one.
+   *
+   * One idempotency key is kept per customer and package (see `purchaseStorage`), saved
+   * before the request, and the checkout id is saved before this resolves. A lost answer, a
+   * retry or a reload therefore reaches the same checkout, never a second one. An attempt
+   * that is over makes room for the next: an expired or failed checkout (nothing was
+   * charged) starts a new one at once; a complete or `needs_review` one is returned once so
+   * you can show it, and the next call starts a new attempt. A refusal because the customer
+   * already has the plan (`already_subscribed`, `already_owned`, `already_purchased`) also
+   * ends the attempt. `checkout_in_progress` and lost connections keep it: call again.
+   * Call it from a click; a second call for the same package while one runs joins it.
+   */
+  purchase(packageId: string, input: PurchaseInput): Promise<Checkout> {
+    try {
+      this.assertActive();
+      validatePackage(packageId);
+      if (
+        !input ||
+        typeof input.successUrl !== "string" ||
+        !input.successUrl ||
+        typeof input.cancelUrl !== "string" ||
+        !input.cancelUrl
+      )
+        throw new CashSDKError(
+          "invalid_return_url",
+          "A success URL and a cancel URL are required",
+        );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const id = `${this.epoch}:${packageId}`;
+    const running = this.purchases.get(id);
+    if (running) return running;
+    const operation = this.runPurchase(packageId, input).finally(() => {
+      if (this.purchases.get(id) === operation) this.purchases.delete(id);
+    });
+    this.purchases.set(id, operation);
+    return operation;
+  }
+
+  /**
+   * The checkout of the customer's current attempt for a package, read again, or null when
+   * there is none. An attempt that is over (complete, expired, failed, needs_review) is
+   * cleared once read, so the next `purchase` starts a new one.
+   */
+  async getPurchase(
+    packageId: string,
+    options: RequestOptions = {},
+  ): Promise<Checkout | null> {
+    this.assertActive();
+    validatePackage(packageId);
+    const slot = await this.purchaseSlot(packageId, options.signal);
+    const attempt = await readAttempt(this.storage, slot);
+    if (!attempt?.id) return null;
+    const checkout = await this.savedCheckout(attempt.id, options.signal);
+    if (!checkout || isOver(checkout)) await clearAttempt(this.storage, slot);
+    return checkout;
+  }
+
+  /**
+   * On the page the customer returns to: wait for the checkout of their attempt for a
+   * package, as `waitForCheckout` does. Null when there is no attempt. A checkout that is
+   * over clears the attempt. Then read the entitlement: a checkout grants nothing.
+   */
+  async waitForPurchase(
+    packageId: string,
+    options: WaitOptions = {},
+  ): Promise<CheckoutOutcome | null> {
+    this.assertActive();
+    validatePackage(packageId);
+    const slot = await this.purchaseSlot(packageId, options.signal);
+    const attempt = await readAttempt(this.storage, slot);
+    if (!attempt?.id) return null;
+    let outcome: CheckoutOutcome;
+    try {
+      outcome = await this.waitForCheckout(attempt.id, options);
+    } catch (error) {
+      if (!isCode(error, "checkout_not_found")) throw error;
+      await clearAttempt(this.storage, slot);
+      return null;
+    }
+    if (isOver(outcome.checkout)) await clearAttempt(this.storage, slot);
+    return outcome;
+  }
+
+  private async runPurchase(
+    packageId: string,
+    input: PurchaseInput,
+  ): Promise<Checkout> {
+    const { signal } = input;
+    const identity = this.generation.signal;
+    const request: CheckoutInput = {
+      packageId,
+      successUrl: input.successUrl,
+      cancelUrl: input.cancelUrl,
+      ...(input.connectionId ? { connectionId: input.connectionId } : {}),
+    };
+    const slot = await this.purchaseSlot(packageId, signal);
+    let attempt: Attempt | null = await readAttempt(this.storage, slot);
+    if (attempt?.id) {
+      const saved = await this.savedCheckout(attempt.id, signal);
+      if (saved?.status === "requires_action") return saved;
+      if (!saved || isOver(saved)) {
+        await clearAttempt(this.storage, slot);
+        // A purchase that went through, or whose outcome Stripe could not settle, is the
+        // answer: show it. The next call starts a new attempt. An expired or failed one
+        // charged nothing, so a new attempt starts now.
+        if (saved && (saved.status === "complete" || saved.status === "needs_review"))
+          return saved;
+        attempt = null;
+      }
+      // A pending checkout is asked for again below, with the same key.
+    }
+    let renewed = false;
+    for (;;) {
+      const fresh = !attempt;
+      if (!attempt) {
+        attempt = { key: attemptKey() };
+        // Saved before the request: a lost answer is retried with the same key.
+        await writeAttempt(this.storage, slot, attempt);
+      }
+      let checkout: Checkout;
+      try {
+        checkout = await this.checkout(request, {
+          idempotencyKey: attempt.key,
+          signal,
+        });
+        // Still being created. The same key picks the same checkout up again.
+        for (let wait = 1000; checkout.status === "pending" && wait <= 3000; wait += 1000) {
+          if (attempt.id !== checkout.id) {
+            attempt = { key: attempt.key, id: checkout.id };
+            await writeAttempt(this.storage, slot, attempt);
+          }
+          await this.pause(wait, [identity, signal]);
+          checkout = await this.checkout(request, {
+            idempotencyKey: attempt.key,
+            signal,
+          });
+        }
+      } catch (error) {
+        if (isCashSDKError(error) && FINAL_REFUSALS.has(error.code))
+          await clearAttempt(this.storage, slot);
+        else if (isCode(error, "idempotency_conflict") && !fresh && !renewed) {
+          // The saved key belongs to another request, for example other return URLs.
+          await clearAttempt(this.storage, slot);
+          attempt = null;
+          renewed = true;
+          continue;
+        }
+        throw error;
+      }
+      if (checkout.status === "expired" || checkout.status === "failed") {
+        await clearAttempt(this.storage, slot);
+        // A saved key can name an attempt that ended since. Start a new one, once.
+        if (!fresh && !renewed) {
+          attempt = null;
+          renewed = true;
+          continue;
+        }
+        return checkout;
+      }
+      if (isOver(checkout)) {
+        await clearAttempt(this.storage, slot);
+        return checkout;
+      }
+      // Saved before the caller redirects, so the return page finds this checkout.
+      await writeAttempt(this.storage, slot, { key: attempt.key, id: checkout.id });
+      return checkout;
+    }
+  }
+
+  /** The storage slot of the signed-in customer's attempt for a package. */
+  private async purchaseSlot(
+    packageId: string,
+    signal: AbortSignal | undefined,
+  ): Promise<string> {
+    const customerId =
+      this.currentCustomer() ?? (await this.getCustomer({ signal })).customerId;
+    return attemptSlot(
+      this.options.publishableKey,
+      this.options.environment,
+      customerId,
+      packageId,
+    );
+  }
+
+  /** A saved checkout, or null once CashSDK no longer knows it for this customer. */
+  private async savedCheckout(
+    id: string,
+    signal: AbortSignal | undefined,
+  ): Promise<Checkout | null> {
+    try {
+      return await this.getCheckout(id, { signal });
+    } catch (error) {
+      if (isCode(error, "checkout_not_found")) return null;
+      throw error;
+    }
   }
 
   /**
@@ -287,28 +598,15 @@ export class CashSDKClient {
       BillingPortal & Customer & { provider: string }
     >("POST", "/v1/web/billing-portal", options, { returnUrl: input.returnUrl });
     this.validateIdentity(result);
-    let url: URL | null = null;
-    try {
-      url = typeof result.url === "string" ? new URL(result.url) : null;
-    } catch {
-      url = null;
-    }
-    if (
-      !url ||
-      result.provider !== "stripe" ||
-      url.protocol !== "https:" ||
-      url.hostname !== "billing.stripe.com" ||
-      url.port ||
-      url.username ||
-      url.password
-    )
+    const url = stripePageUrl(result.url, "portal");
+    if (!url || result.provider !== "stripe")
       throw new CashSDKError(
         "invalid_response",
         "Unsupported billing portal URL",
       );
     if (epoch !== this.epoch)
       throw new CashSDKError("identity_changed", "Customer session changed");
-    return { url: url.href };
+    return { url };
   }
 
   /**
@@ -378,12 +676,12 @@ export class CashSDKClient {
       timeout < 0 ||
       timeout > 300000 ||
       !Number.isFinite(interval) ||
-      interval < 100 ||
+      interval < 1000 ||
       interval > 5000
     )
       throw new CashSDKError(
         "invalid_configuration",
-        "timeoutMs must be at most 300000 and intervalMs between 100 and 5000",
+        "timeoutMs must be at most 300000 and intervalMs between 1000 and 5000",
       );
     const deadline = Date.now() + timeout;
     const identity = this.generation.signal;
@@ -448,39 +746,41 @@ export class CashSDKClient {
     if (
       !checkout ||
       typeof checkout.id !== "string" ||
+      !checkout.id ||
       checkout.environment !== this.options.environment ||
       checkout.provider !== "stripe" ||
-      ![
-        "pending",
-        "requires_action",
-        "complete",
-        "expired",
-        "failed",
-        "needs_review",
-      ].includes(checkout.status)
+      typeof checkout.status !== "string" ||
+      (checkout.customerId !== undefined &&
+        checkout.customerId !== null &&
+        (typeof checkout.customerId !== "string" || !checkout.customerId))
     )
       throw new CashSDKError("invalid_response", "Invalid checkout response");
+    // Another tab can change the customer behind this one. A checkout for someone else is
+    // never shown here.
+    const owner = this.currentCustomer();
+    if (checkout.customerId && owner && checkout.customerId !== owner) {
+      this.identityChanged();
+      throw new CashSDKError(
+        "identity_changed",
+        "This checkout belongs to another customer. Use setSessionTokenProvider before changing customers",
+      );
+    }
+    let action: Checkout["action"] = null;
     if (checkout.action) {
-      let url: URL;
-      try {
-        url = new URL(checkout.action.url);
-      } catch {
-        throw new CashSDKError("invalid_response", "Invalid checkout action");
-      }
-      if (
-        checkout.action.type !== "redirect" ||
-        url.protocol !== "https:" ||
-        url.hostname !== "checkout.stripe.com" ||
-        url.port ||
-        url.username ||
-        url.password
-      )
+      const url =
+        checkout.action.type === "redirect"
+          ? stripePageUrl(checkout.action.url, "checkout")
+          : null;
+      if (!url)
         throw new CashSDKError(
           "invalid_response",
           "Unsupported checkout action",
         );
+      action = { type: "redirect", url };
     }
-    return checkout;
+    // A status this version does not know yet is read as pending: not settled, keep the key.
+    const status = STATUSES.has(checkout.status) ? checkout.status : "pending";
+    return { ...checkout, status, action };
   }
 
   setSessionTokenProvider(provider: SessionTokenProvider): void {
@@ -496,18 +796,40 @@ export class CashSDKClient {
     this.provider = provider;
     this.signedOut = false;
     this.update(initial());
+    this.broadcast({ type: "customer_changed" });
     // The previous customer's session is dropped here and ended at CashSDK, so it cannot
     // outlive the account change. Nothing waits for it, and a failure changes nothing.
     if (token) void this.revoke(token).catch(() => {});
   }
 
-  async logout(): Promise<void> {
-    if (this.closed || this.signedOut) return;
+  /**
+   * Sign out. It resolves as soon as this client holds nothing of the customer, and other
+   * tabs of the app drop their access too. Ending this tab's session at CashSDK runs on its
+   * own: `revocation` says how it went and never rejects. Do not wait for it before your
+   * own sign-out, whose `revokeWebSessions` ends every session of the customer anyway.
+   */
+  async logout(): Promise<LogoutResult> {
+    const done: Promise<RevocationResult> = Promise.resolve({
+      revoked: true,
+      error: null,
+    });
+    if (this.closed || this.signedOut) return { revocation: done };
     const token = this.token;
+    const customerId = this.currentCustomer();
     this.clearIdentity();
     this.signedOut = true;
     this.update({ ...initial(), status: "signed_out" });
-    if (token) await this.revoke(token);
+    this.broadcast({ type: "signed_out", customerId });
+    if (!token) return { revocation: done };
+    return {
+      revocation: this.revoke(token).then(
+        (): RevocationResult => ({ revoked: true, error: null }),
+        (error: unknown): RevocationResult => ({
+          revoked: false,
+          error: toCashSDKError(error),
+        }),
+      ),
+    };
   }
 
   /** End one session at CashSDK. A 401 means it has already ended. */
@@ -516,7 +838,7 @@ export class CashSDKClient {
     const timer = setTimeout(
       () =>
         controller.abort(
-          new CashSDKError("timeout", "Session revocation timed out"),
+          new CashSDKError("timeout", "Session revocation timed out", 0, true),
         ),
       this.timeout,
     );
@@ -532,8 +854,10 @@ export class CashSDKClient {
         }),
         controller.signal,
       );
-      if (response.status !== 401)
-        await withAbort(responseJSON(response), controller.signal);
+      // Read to the end in every case, so the request completes rather than hangs open.
+      const text = await withAbort(responseText(response), controller.signal);
+      if (!response.ok && response.status !== 401)
+        throw responseError(response, text);
     } finally {
       clearTimeout(timer);
     }
@@ -545,6 +869,11 @@ export class CashSDKClient {
     this.closed = true;
     this.update({ ...initial(), status: "destroyed" });
     this.listeners.clear();
+    try {
+      this.channel?.close();
+    } catch {
+      /* Already closed. */
+    }
   }
 
   private validateIdentity(customer: Customer) {
@@ -558,17 +887,63 @@ export class CashSDKClient {
         "environment_mismatch",
         "The server response does not match this client's customer environment",
       );
-    const previous =
-      this.state.customer?.customerId ?? this.state.entitlements?.customerId;
+    const previous = this.currentCustomer();
     if (previous && customer.customerId !== previous) {
-      this.clearIdentity();
-      this.signedOut = true;
-      this.update({ ...initial(), status: "signed_out" });
+      this.identityChanged();
       throw new CashSDKError(
         "identity_changed",
         "Use setSessionTokenProvider before changing customers",
       );
     }
+  }
+
+  /** The session now names someone else: drop everything and wait for the merchant. */
+  private identityChanged() {
+    this.clearIdentity();
+    this.signedOut = true;
+    this.update({ ...initial(), status: "signed_out" });
+    this.broadcast({ type: "customer_changed" });
+  }
+
+  private currentCustomer(): string | null {
+    return (
+      this.state.customer?.customerId ?? this.state.entitlements?.customerId ?? null
+    );
+  }
+
+  private broadcast(message: Broadcast) {
+    try {
+      this.channel?.postMessage(message);
+    } catch {
+      /* Closed, or the runtime refused the message: other tabs read again on their own. */
+    }
+  }
+
+  /**
+   * Another tab signed out or changed the customer. A sign-out of this tab's customer signs
+   * this tab out too. A new customer sends this tab back to idle, to load whoever the backend
+   * now signs in. Either way the access shown here is dropped and this tab's session ended.
+   */
+  private received(data: unknown) {
+    if (this.closed || !data || typeof data !== "object") return;
+    const message = data as { type?: unknown; customerId?: unknown };
+    if (message.type === "signed_out") {
+      if (this.signedOut) return;
+      const current = this.currentCustomer();
+      if (typeof message.customerId === "string" && current && message.customerId !== current)
+        return;
+      this.dropSession(true);
+    } else if (message.type === "customer_changed") {
+      this.dropSession(false);
+    }
+  }
+
+  private dropSession(signOut: boolean) {
+    const token = this.token;
+    this.clearIdentity();
+    this.signedOut = signOut;
+    this.update(signOut ? { ...initial(), status: "signed_out" } : initial());
+    if (token) void this.revoke(token).catch(() => {});
   }
 
   private async request<T>(
@@ -618,13 +993,18 @@ export class CashSDKClient {
           controller.signal,
         );
         if (response.status === 401 && attempt === 0) {
+          // A key CashSDK refuses is a configuration error: a new session cannot fix it, so
+          // the backend is not asked for one.
+          const refusal = responseError(
+            response,
+            await withAbort(responseText(response), controller.signal),
+          );
+          if (refusal.code === "invalid_publishable_key") throw refusal;
           // Another concurrent request may already have replaced this rejected token.
           if (this.token === token) {
             this.token = undefined;
             this.tokenExpiry = 0;
           }
-          if (response.body)
-            await withAbort(response.body.cancel(), controller.signal);
           continue;
         }
         const result = await withAbort(
@@ -675,13 +1055,31 @@ export class CashSDKClient {
       this.timeout,
     );
     const refresh = withAbort(
-      Promise.resolve().then(() => {
-        aborted(controller.signal);
-        return this.provider({ signal: controller.signal });
-      }),
+      Promise.resolve()
+        .then(() => {
+          aborted(controller.signal);
+          return this.provider({ signal: controller.signal });
+        })
+        .catch((error: unknown) => {
+          // The merchant's provider failed, usually because nobody is signed in there.
+          throw controller.signal.aborted || isCashSDKError(error)
+            ? error
+            : new CashSDKError(
+                "session_unavailable",
+                error instanceof Error && error.message
+                  ? error.message
+                  : "Your backend did not return a customer session",
+                0,
+                false,
+                undefined,
+                undefined,
+                { cause: error },
+              );
+        }),
       controller.signal,
     )
       .then((result) => {
+        const receivedAt = Date.now();
         if (
           typeof result !== "string" &&
           (!result || typeof result.token !== "string")
@@ -691,26 +1089,22 @@ export class CashSDKClient {
             "The merchant backend returned an invalid session",
           );
         const token = typeof result === "string" ? result : result.token;
-        const expiresAt =
-          typeof result === "string" || !result.expiresAt
-            ? Date.now() + 60000
-            : Date.parse(result.expiresAt);
+        const expiry =
+          typeof result === "string"
+            ? receivedAt + SHORT_SESSION_MS
+            : sessionExpiry(result, receivedAt);
         if (epoch !== this.epoch)
           throw new CashSDKError(
             "identity_changed",
             "Customer session changed",
           );
-        if (
-          !/^csk_ws_[A-Za-z0-9_-]{43}$/.test(token) ||
-          !Number.isFinite(expiresAt) ||
-          expiresAt <= Date.now()
-        )
+        if (!/^csk_ws_[A-Za-z0-9_-]{43}$/.test(token) || expiry === null)
           throw new CashSDKError(
             "invalid_web_session",
             "The merchant backend returned an invalid or expired session",
           );
         this.token = token;
-        this.tokenExpiry = expiresAt;
+        this.tokenExpiry = expiry;
         return token;
       })
       .finally(() => {
@@ -746,6 +1140,7 @@ export class CashSDKClient {
     this.tokenExpiry = 0;
     this.refresh = undefined;
     this.initializing = undefined;
+    this.purchases.clear();
   }
   private update(snapshot: ClientSnapshot) {
     this.state = Object.freeze(snapshot);
@@ -758,6 +1153,11 @@ export class CashSDKClient {
       }
     }
   }
+}
+
+function validatePackage(packageId: unknown): asserts packageId is string {
+  if (typeof packageId !== "string" || !packageId || packageId.length > 200)
+    throw new CashSDKError("invalid_package", "A package ID is required");
 }
 
 export function createCashSDK(options: CashSDKOptions): CashSDKClient {

@@ -1,6 +1,6 @@
 {
   "name": "cashsdk-react",
-  "version": "0.1.0-alpha.2",
+  "version": "1.0.0",
   "description": "React bindings for CashSDK web customer sessions and entitlements",
   "author": "CashSDK <support@cashsdk.com>",
   "homepage": "https://docs.cashsdk.com/sdk/web",
@@ -43,13 +43,12 @@
     "test": "node --test test/*.test.mjs",
     "lint": "tsc -p tsconfig.json --noEmit"
   },
-  "dependencies": {
-    "cashsdk-web": "workspace:*"
-  },
   "peerDependencies": {
+    "cashsdk-web": "workspace:^",
     "react": "^18.0.0 || ^19.0.0"
   },
   "devDependencies": {
+    "cashsdk-web": "workspace:*",
     "typescript": "^5.7.3",
     "@types/react": "^19.1.14",
     "react": "19.1.3",

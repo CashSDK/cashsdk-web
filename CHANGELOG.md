@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.0.0
+
+First stable release. Stripe checkout started by the SDK is available in Sandbox and Production
+for websites, Chrome extensions and directly distributed Mac apps.
+
+- `cashsdk-web`: `purchase(packageId, urls)`, `getPurchase(packageId)` and `waitForPurchase()`.
+  A purchase resumes the customer's open checkout for that package, retries a pending one with
+  the same idempotency key and starts a new attempt once the last one is over. Attempts are kept
+  in `sessionStorage` by default (`purchaseStorage` replaces it).
+- Checkout sells Stripe subscriptions and one-time products, with free trials from the product's
+  intro offer, optional promotion codes and Stripe Tax. Payments are card only, so access never
+  starts before the money arrives. Sessions last 60 minutes.
+- New refusal codes: `already_subscribed`, `already_owned`, `already_purchased` (409) and
+  `checkout_in_progress` (retryable, with `Retry-After`). `invalid_publishable_key` (403) no
+  longer looks like an expired session.
+- Checkout and billing portal URLs on a Stripe custom domain are accepted.
+- Session expiry follows `expiresInSeconds`, so a wrong device clock no longer ends a session
+  early or keeps one too long.
+- `logout()` resolves to `{ revocation }` once local access is gone. A sign-out or a customer
+  change in one tab reaches the other tabs of the same site.
+- Errors without a JSON body become `http_<status>`, retryable for 429 and 5xx, and keep
+  `Retry-After`. An `intervalMs` below 1000 is refused, so waits poll at most once a second.
+- `cashsdk-react`: `usePurchase()`. Every hook error is a `CashSDKError`, and a result or error
+  for one customer is never shown to the next.
+- `cashsdk-react` and `cashsdk-node` take `cashsdk-web` as a peer dependency.
+- `cashsdk-node`: `Retry-After` is kept on errors, methods reject bad input asynchronously, and
+  `getEntitlements` returns the server's shape (`object`, `rank`).
+- `cashsdk-web/extension` refuses to run in a content script.
+
 ## 0.1.0-alpha.2
 
 - Add the MV3 extension entry point and runnable Chrome example.

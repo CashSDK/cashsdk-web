@@ -1,6 +1,6 @@
 {
   "name": "cashsdk-web",
-  "version": "0.1.0-alpha.2",
+  "version": "1.0.0",
   "description": "CashSDK customer sessions and entitlements for web applications",
   "author": "CashSDK <support@cashsdk.com>",
   "homepage": "https://docs.cashsdk.com/sdk/web",
@@ -43,6 +43,13 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "extension": [
+        "./dist/extension.d.ts"
+      ]
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "node --test test/*.test.mjs",

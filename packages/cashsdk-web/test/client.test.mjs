@@ -252,7 +252,7 @@ test("waiting for a checkout ends when the provider reports a final state", asyn
   ];
   let reads = 0;
   const sdk = client({ fetch: async () => json(states[reads++]) });
-  const outcome = await sdk.waitForCheckout("checkout_1", { intervalMs: 100 });
+  const outcome = await sdk.waitForCheckout("checkout_1", { intervalMs: 1000 });
   assert.equal(outcome.settled, true);
   assert.equal(outcome.checkout.paymentStatus, "paid");
   assert.equal(reads, 3);
@@ -270,7 +270,7 @@ test("a wait that runs out reports an open checkout, never a failed payment", as
   const started = Date.now();
   const outcome = await sdk.waitForCheckout("checkout_1", {
     timeoutMs: 350,
-    intervalMs: 100,
+    intervalMs: 1000,
   });
   assert.equal(outcome.settled, false);
   assert.equal(outcome.checkout.status, "requires_action");
@@ -282,10 +282,11 @@ test("a wait that runs out reports an open checkout, never a failed payment", as
     sdk.waitForCheckout("checkout_1", { timeoutMs: 300001 }),
     /timeoutMs/,
   );
-  await assert.rejects(
-    sdk.waitForCheckout("checkout_1", { intervalMs: 10 }),
-    /intervalMs/,
-  );
+  for (const intervalMs of [10, 100, 999, 5001])
+    await assert.rejects(
+      sdk.waitForCheckout("checkout_1", { intervalMs }),
+      /intervalMs between 1000 and 5000/,
+    );
   sdk.destroy();
 });
 
@@ -307,7 +308,7 @@ test("a wait survives failures a retry can fix and stops on ones it cannot", asy
       return json(checkoutState("complete", "paid"));
     },
   });
-  const outcome = await sdk.waitForCheckout("checkout_1", { intervalMs: 100 });
+  const outcome = await sdk.waitForCheckout("checkout_1", { intervalMs: 1000 });
   assert.equal(outcome.settled, true);
   assert.equal(reads, 3);
   const refused = client({
@@ -318,7 +319,7 @@ test("a wait survives failures a retry can fix and stops on ones it cannot", asy
       ),
   });
   await assert.rejects(
-    refused.waitForCheckout("checkout_1", { intervalMs: 100 }),
+    refused.waitForCheckout("checkout_1", { intervalMs: 1000 }),
     (error) => error.code === "checkout_not_found",
   );
   const down = client({
@@ -326,7 +327,7 @@ test("a wait survives failures a retry can fix and stops on ones it cannot", asy
       json({ error: { code: "service_unavailable", message: "Down" } }, 503),
   });
   await assert.rejects(
-    down.waitForCheckout("checkout_1", { timeoutMs: 250, intervalMs: 100 }),
+    down.waitForCheckout("checkout_1", { timeoutMs: 250, intervalMs: 1000 }),
     (error) => error.code === "service_unavailable" && error.retryable,
   );
   sdk.destroy();
@@ -418,11 +419,11 @@ test("a wait keeps reading through a lost connection until its deadline", async 
       );
     },
   });
-  const outcome = await sdk.waitForCheckout("checkout_1", { intervalMs: 100 });
+  const outcome = await sdk.waitForCheckout("checkout_1", { intervalMs: 1000 });
   assert.equal(outcome.settled, true);
   assert.equal(reads, 3);
   reads = 0;
-  const access = await sdk.waitForEntitlement("pro", { intervalMs: 100 });
+  const access = await sdk.waitForEntitlement("pro", { intervalMs: 1000 });
   assert.equal(access.active, true);
   assert.equal(reads, 3);
 
@@ -435,7 +436,7 @@ test("a wait keeps reading through a lost connection until its deadline", async 
   });
   const open = await flaky.waitForCheckout("checkout_1", {
     timeoutMs: 300,
-    intervalMs: 100,
+    intervalMs: 1000,
   });
   assert.equal(open.settled, false, "the last checkout read is kept");
   assert.equal(open.checkout.status, "requires_action");
@@ -447,7 +448,7 @@ test("a wait keeps reading through a lost connection until its deadline", async 
     },
   });
   await assert.rejects(
-    down.waitForEntitlement("pro", { timeoutMs: 250, intervalMs: 100 }),
+    down.waitForEntitlement("pro", { timeoutMs: 250, intervalMs: 1000 }),
     (error) => error.code === "network_error",
   );
   sdk.destroy();
@@ -467,7 +468,7 @@ test("an abort, a sign-out or a timeout still ends a wait through a lost connect
   const waiting = sdk.waitForEntitlement("pro", {
     signal: controller.signal,
     timeoutMs: 60000,
-    intervalMs: 100,
+    intervalMs: 1000,
   });
   setTimeout(() => controller.abort(new Error("left the page")), 150);
   const started = Date.now();
@@ -477,16 +478,18 @@ test("an abort, a sign-out or a timeout still ends a wait through a lost connect
   const signedOut = offline();
   const access = signedOut.waitForCheckout("checkout_1", {
     timeoutMs: 60000,
-    intervalMs: 100,
+    intervalMs: 1000,
   });
   let loggedOut;
   setTimeout(() => {
     loggedOut = signedOut.logout();
-    loggedOut.catch(() => {});
   }, 150);
   await assert.rejects(access, (error) => error.code === "identity_changed");
-  // Ending the session at CashSDK needs the network too, and says so.
-  await assert.rejects(loggedOut, (error) => error.code === "network_error");
+  // Sign-out itself succeeds. Ending the session at CashSDK needs the network too, and says so.
+  const { revocation } = await loggedOut;
+  const ended = await revocation;
+  assert.equal(ended.revoked, false);
+  assert.equal(ended.error.code, "network_error");
   assert.equal(signedOut.getSnapshot().status, "signed_out");
 
   // A fetch that fails once it is aborted reports the timeout, not a lost connection.
@@ -528,13 +531,13 @@ test("waiting for an entitlement follows access as it arrives and expires", asyn
       return json(snapshot());
     },
   });
-  const outcome = await sdk.waitForEntitlement("pro", { intervalMs: 100 });
+  const outcome = await sdk.waitForEntitlement("pro", { intervalMs: 1000 });
   assert.equal(outcome.active, true);
   assert.equal(reads, 3);
   assert.equal(sdk.getSnapshot().entitlements, outcome.snapshot);
   const other = await sdk.waitForEntitlement("team", {
     timeoutMs: 150,
-    intervalMs: 100,
+    intervalMs: 1000,
   });
   assert.equal(other.active, false);
   await assert.rejects(sdk.waitForEntitlement(""), /identifier/);
@@ -678,11 +681,21 @@ test("the billing portal is the signed-in customer's, on Stripe, and never navig
   assert.equal(observed.credentials, "omit");
   assert.equal(observed.redirect, "error");
   assert.equal(observed.headers["Idempotency-Key"], undefined);
+  // A Stripe custom domain serves the portal under /p/session/.
+  body = { ...portal, url: "https://billing.merchant.example/p/session/test_2" };
+  assert.deepEqual(
+    await sdk.openBillingPortal({ returnUrl: "https://merchant.example/account" }),
+    { url: "https://billing.merchant.example/p/session/test_2" },
+  );
   for (const bad of [
-    { ...portal, url: "https://attacker.example/p/session/x" },
+    { ...portal, url: "https://attacker.example/session/x" },
     { ...portal, url: "https://billing.stripe.com.attacker.example/p" },
     { ...portal, url: "http://billing.stripe.com/p/session/x" },
     { ...portal, url: "https://billing.stripe.com:444/p/session/x" },
+    { ...portal, url: "https://127.0.0.1/p/session/x" },
+    { ...portal, url: "https://localhost/p/session/x" },
+    { ...portal, url: "https://user:pass@billing.merchant.example/p/session/x" },
+    { ...portal, url: "https://billing.merchant.example/c/pay/x" },
     { ...portal, url: "not a url" },
     { ...portal, url: null },
     { ...portal, provider: "paypal" },
@@ -755,4 +768,320 @@ test("a portal opened for one customer is not returned after the customer change
   release();
   await assert.rejects(opening, (error) => error.code === "identity_changed");
   sdk.destroy();
+});
+
+test("checkout pages on a Stripe custom domain are accepted, anything else is not", async () => {
+  let action;
+  const sdk = client({
+    fetch: async () =>
+      json({ ...checkoutState("requires_action"), action: { type: "redirect", url: action } }),
+  });
+  for (const url of [
+    "https://checkout.stripe.com/c/pay/cs_test_1#fragment",
+    "https://pay.merchant.example/c/pay/cs_test_1",
+    "https://checkout.stripe.com/other/path",
+  ]) {
+    action = url;
+    assert.equal((await sdk.getCheckout("checkout_1")).action.url, new URL(url).href);
+  }
+  for (const url of [
+    "https://pay.merchant.example/pay/cs_test_1",
+    "http://pay.merchant.example/c/pay/cs_test_1",
+    "https://pay.merchant.example:8443/c/pay/cs_test_1",
+    "https://user:pass@pay.merchant.example/c/pay/cs_test_1",
+    "https://127.0.0.1/c/pay/cs_test_1",
+    "https://[::1]/c/pay/cs_test_1",
+    "https://localhost/c/pay/cs_test_1",
+    "https://billing.stripe.com/p/session/x",
+    "javascript:alert(1)",
+  ]) {
+    action = url;
+    await assert.rejects(sdk.getCheckout("checkout_1"), { code: "invalid_response" }, url);
+  }
+  sdk.destroy();
+});
+
+test("a checkout status this version does not know reads as pending and is waited on", async () => {
+  const states = [
+    { ...checkoutState("pending"), status: "processing" },
+    { ...checkoutState("pending"), status: "awaiting_bank" },
+    checkoutState("complete", "paid"),
+  ];
+  let reads = 0;
+  const sdk = client({ fetch: async () => json(states[Math.min(reads++, 2)]) });
+  const read = await sdk.getCheckout("checkout_1");
+  assert.equal(read.status, "pending");
+  const outcome = await sdk.waitForCheckout("checkout_1", { intervalMs: 1000 });
+  assert.equal(outcome.settled, true);
+  assert.equal(outcome.checkout.status, "complete");
+  const malformed = client({
+    fetch: async () => json({ ...checkoutState("pending"), status: 7 }),
+  });
+  await assert.rejects(malformed.getCheckout("checkout_1"), { code: "invalid_response" });
+  sdk.destroy();
+  malformed.destroy();
+});
+
+test("a checkout for another customer is never shown, and signs this client out", async () => {
+  let owner = "customer_1";
+  const sdk = client({
+    fetch: async (url) =>
+      json(
+        url.endsWith("/customer")
+          ? customer
+          : url.endsWith("/entitlements")
+            ? snapshot()
+            : { ...checkoutState("requires_action"), customerId: owner },
+      ),
+  });
+  await sdk.initialize();
+  assert.equal((await sdk.getCheckout("checkout_1")).customerId, "customer_1");
+  owner = "customer_2";
+  await assert.rejects(sdk.getCheckout("checkout_1"), { code: "identity_changed" });
+  assert.equal(sdk.getSnapshot().status, "signed_out");
+  assert.equal(sdk.getSnapshot().entitlements, null);
+  // An older server leaves the owner out: the checkout is read as before.
+  const older = client({ fetch: async () => json(checkoutState("requires_action")) });
+  assert.equal((await older.getCheckout("checkout_1")).status, "requires_action");
+  sdk.destroy();
+  older.destroy();
+});
+
+test("session expiry follows this device's clock, so a skewed clock never rejects every token", async () => {
+  const realNow = Date.now;
+  let calls = 0;
+  let result;
+  const sdk = client({
+    getSessionToken: async () => {
+      calls++;
+      return result();
+    },
+  });
+  try {
+    // The server's clock is behind this one: its absolute expiry is already past here.
+    result = () => ({ token: token(), expiresAt: new Date(realNow() - 300000).toISOString() });
+    await sdk.getCustomer();
+    await sdk.getCustomer();
+    assert.equal(calls, 1, "the token is used, and reused for a while");
+    // The relative lifetime wins over an absolute one.
+    sdk.setSessionTokenProvider(async () => {
+      calls++;
+      return { token: token("b"), expiresInSeconds: 600, expiresAt: new Date(realNow() - 3600000).toISOString() };
+    });
+    calls = 0;
+    await sdk.getCustomer();
+    Date.now = () => realNow() + 9 * 60000;
+    await sdk.getCustomer();
+    assert.equal(calls, 1, "ten minutes from receipt, on this clock");
+    Date.now = () => realNow() + 10 * 60000;
+    await sdk.getCustomer();
+    assert.equal(calls, 2, "and renewed when they run out");
+    Date.now = realNow;
+    // This clock is behind the server's: an absolute expiry far away is capped at ten minutes.
+    sdk.setSessionTokenProvider(async () => {
+      calls++;
+      return { token: token("c"), expiresAt: new Date(realNow() + 7200000).toISOString() };
+    });
+    calls = 0;
+    await sdk.getCustomer();
+    Date.now = () => realNow() + 11 * 60000;
+    await sdk.getCustomer();
+    assert.equal(calls, 2);
+  } finally {
+    Date.now = realNow;
+  }
+  for (const bad of [{ expiresInSeconds: 0 }, { expiresInSeconds: -5 }, { expiresInSeconds: "600" }, { expiresAt: "soon" }]) {
+    sdk.setSessionTokenProvider(async () => ({ token: token(), ...bad }));
+    await assert.rejects(sdk.getCustomer(), { code: "invalid_web_session" }, JSON.stringify(bad));
+  }
+  sdk.destroy();
+});
+
+test("a refused publishable key is a configuration error, never a reason for a new session", async () => {
+  for (const status of [401, 403]) {
+    let sessions = 0;
+    let requests = 0;
+    const sdk = client({
+      getSessionToken: async () => {
+        sessions++;
+        return token();
+      },
+      fetch: async () => {
+        requests++;
+        return json({ error: { code: "invalid_publishable_key", message: "Unknown publishable key", retryable: false } }, status);
+      },
+    });
+    await assert.rejects(sdk.initialize(), { code: "invalid_publishable_key", status, retryable: false });
+    assert.equal(sessions, 1, `${status}: one session, not a new one per request`);
+    assert.equal(requests, 2, `${status}: the two reads of initialize, each sent once`);
+    assert.equal(sdk.getSnapshot().status, "error");
+    assert.equal(sdk.getSnapshot().error.code, "invalid_publishable_key");
+    sdk.destroy();
+  }
+});
+
+test("an error page from a proxy is classified by its status, not refused as invalid", async () => {
+  const page = (status, headers = {}) => async () =>
+    new Response("<html><body>Bad gateway</body></html>", { status, headers: { "Content-Type": "text/html", ...headers } });
+  for (const [status, headers, retryable, retryAfterMs] of [
+    [502, {}, true, undefined],
+    [503, { "Retry-After": "3" }, true, 3000],
+    [429, { "Retry-After": "7" }, true, 7000],
+    [403, {}, false, undefined],
+  ]) {
+    const sdk = client({ fetch: page(status, headers) });
+    await assert.rejects(sdk.getCustomer(), (error) => {
+      assert(error instanceof CashSDKError);
+      assert.equal(error.code, `http_${status}`);
+      assert.equal(error.status, status);
+      assert.equal(error.retryable, retryable);
+      assert.equal(error.retryAfterMs, retryAfterMs);
+      return true;
+    });
+    sdk.destroy();
+  }
+  // A success that is not JSON is still a broken response.
+  const garbled = client({ fetch: page(200) });
+  await assert.rejects(garbled.getCustomer(), { code: "invalid_response", retryable: false });
+  garbled.destroy();
+  // A wait reads on through a proxy's 502 page.
+  let reads = 0;
+  const waiting = client({
+    fetch: async () =>
+      ++reads === 1
+        ? new Response("<html>502</html>", { status: 502 })
+        : json(checkoutState("complete", "paid")),
+  });
+  assert.equal((await waiting.waitForCheckout("checkout_1", { intervalMs: 1000 })).settled, true);
+  waiting.destroy();
+});
+
+test("logout resolves once local state is cleared and reports the revocation on its own", async () => {
+  const sdk = client({
+    timeoutMs: 100,
+    fetch: async (url, init) =>
+      init.method === "DELETE"
+        ? new Promise(() => {})
+        : json(url.endsWith("/customer") ? customer : snapshot()),
+  });
+  await sdk.initialize();
+  const started = Date.now();
+  const { revocation } = await sdk.logout();
+  assert(Date.now() - started < 50, "sign-out does not wait for CashSDK");
+  assert.equal(sdk.getSnapshot().status, "signed_out");
+  const result = await revocation;
+  assert.equal(result.revoked, false);
+  assert.equal(result.error.code, "timeout");
+  // Signed out already: nothing more to end.
+  assert.deepEqual(await (await sdk.logout()).revocation, { revoked: true, error: null });
+  const ok = client();
+  await ok.initialize();
+  assert.deepEqual(await (await ok.logout()).revocation, { revoked: true, error: null });
+  // A session that already ended (401) counts as revoked.
+  const ended = client({
+    fetch: async (url, init) =>
+      init.method === "DELETE"
+        ? json({ error: { code: "invalid_web_session" } }, 401)
+        : json(url.endsWith("/customer") ? customer : snapshot()),
+  });
+  await ended.initialize();
+  assert.deepEqual(await (await ended.logout()).revocation, { revoked: true, error: null });
+  // No session yet: nothing to end, and no request.
+  let requests = 0;
+  const fresh = client({ fetch: async () => (requests++, json(customer)) });
+  assert.deepEqual(await (await fresh.logout()).revocation, { revoked: true, error: null });
+  assert.equal(requests, 0);
+  for (const value of [sdk, ok, ended, fresh]) value.destroy();
+});
+
+test("a failing session provider is a CashSDKError with the provider's error as its cause", async () => {
+  const reason = new Error("Sign in to continue");
+  const sdk = client({
+    getSessionToken: async () => {
+      throw reason;
+    },
+  });
+  await assert.rejects(sdk.initialize(), (error) => {
+    assert(error instanceof CashSDKError);
+    assert.equal(error.code, "session_unavailable");
+    assert.equal(error.message, "Sign in to continue");
+    assert.equal(error.retryable, false);
+    assert.equal(error.cause, reason);
+    return true;
+  });
+  assert.equal(sdk.getSnapshot().error.code, "session_unavailable");
+  // An error that is already the SDK's passes through.
+  const own = new CashSDKError("invalid_configuration", "No backend");
+  const passing = client({
+    getSessionToken: async () => {
+      throw own;
+    },
+  });
+  await assert.rejects(passing.getCustomer(), (error) => error === own);
+  // Anything else that reaches the state is wrapped too, so the state always has a code.
+  const aborting = client({
+    fetch: async () => {
+      throw new DOMException("The operation was aborted", "AbortError");
+    },
+  });
+  await assert.rejects(aborting.initialize(), { name: "AbortError" });
+  assert.equal(aborting.getSnapshot().error.code, "unknown_error");
+  assert.equal(aborting.getSnapshot().error.cause.name, "AbortError");
+  for (const value of [sdk, passing, aborting]) value.destroy();
+});
+
+test("tabs of one app follow a sign-out or a change of customer in another tab", async () => {
+  globalThis.location = { origin: "https://merchant.example" };
+  const revoked = [];
+  const tab = (publishableKey = "csk_pk_tabs", letter = "a") =>
+    client({
+      publishableKey,
+      getSessionToken: async () => token(letter),
+      fetch: async (url, init) => {
+        if (init.method === "DELETE") {
+          revoked.push(init.headers["X-CashSDK-Web-Session"]);
+          return json({ revoked: true });
+        }
+        return json(url.endsWith("/customer") ? customer : snapshot());
+      },
+    });
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 30));
+  try {
+    const first = tab("csk_pk_tabs", "a");
+    const second = tab("csk_pk_tabs", "b");
+    const otherApp = tab("csk_pk_other", "c");
+    await Promise.all([first.initialize(), second.initialize(), otherApp.initialize()]);
+    await first.logout();
+    await settle();
+    assert.equal(second.getSnapshot().status, "signed_out", "the other tab signs out too");
+    assert.equal(second.getSnapshot().entitlements, null, "and shows no access");
+    assert(revoked.includes(token("b")), "and ends its own session");
+    assert.equal(otherApp.getSnapshot().status, "ready", "another app is left alone");
+    await assert.rejects(second.getEntitlements(), { code: "signed_out" });
+
+    // Signing in again in one tab sends the others back to idle, to load whoever is signed in.
+    first.setSessionTokenProvider(async () => token("d"));
+    await settle();
+    assert.equal(second.getSnapshot().status, "idle");
+    assert.equal((await second.initialize()).status, "ready");
+
+    // A sign-out of another customer leaves this tab's customer signed in.
+    const bob = new BroadcastChannel("cashsdk:csk_pk_tabs:sandbox");
+    bob.postMessage({ type: "signed_out", customerId: "customer_9" });
+    await settle();
+    assert.equal(second.getSnapshot().status, "ready");
+    bob.close();
+    for (const value of [first, second, otherApp]) value.destroy();
+  } finally {
+    delete globalThis.location;
+  }
+  // Outside a browser no channel is opened, and nothing is shared.
+  const server = tab("csk_pk_tabs", "f");
+  const peer = tab("csk_pk_tabs", "g");
+  await Promise.all([server.initialize(), peer.initialize()]);
+  await server.logout();
+  await settle();
+  assert.equal(peer.getSnapshot().status, "ready");
+  server.destroy();
+  peer.destroy();
 });

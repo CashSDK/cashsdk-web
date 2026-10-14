@@ -52,6 +52,13 @@ const staticFiles = new Map([
       "text/javascript; charset=utf-8",
     ],
   ],
+  [
+    "/sdk/purchase.js",
+    [
+      "../../packages/cashsdk-web/dist/purchase.js",
+      "text/javascript; charset=utf-8",
+    ],
+  ],
 ]);
 
 const server = createServer(async (request, response) => {

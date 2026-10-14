@@ -7,8 +7,10 @@ import {
   CashSDKProvider,
   useBillingPortal,
   useCheckout,
+  useCustomer,
   useEntitlements,
   useOfferings,
+  usePurchase,
   useSubscriptions,
 } from "../dist/index.js";
 
@@ -82,6 +84,7 @@ test("server rendering reads nothing for the customer and starts no checkout", a
     const offerings = useOfferings();
     const subscriptions = useSubscriptions();
     const checkout = useCheckout();
+    const purchase = usePurchase();
     return createElement(
       "span",
       null,
@@ -92,6 +95,8 @@ test("server rendering reads nothing for the customer and starts no checkout", a
         subscriptions.subscriptions.length,
         checkout.status,
         typeof checkout.start,
+        purchase.status,
+        typeof purchase.start,
       ].join(":"),
     );
   }
@@ -102,7 +107,7 @@ test("server rendering reads nothing for the customer and starts no checkout", a
       createElement(CashSDKProvider, { client: sdk }, createElement(Page)),
     ),
   );
-  assert.equal(html, "<span>idle:null:idle:0:idle:function</span>");
+  assert.equal(html, "<span>idle:null:idle:0:idle:function:idle:function</span>");
   assert.equal(requests, count);
   sdk.destroy();
 });
@@ -225,4 +230,93 @@ test("hooks outside the provider fail with a message that says why", () => {
     () => renderToString(createElement(Orphan)),
     /CashSDK hooks require CashSDKProvider/,
   );
+});
+
+test("a purchase starts only from a handler; a double click joins it and another package waits", async () => {
+  const posted = [];
+  let release;
+  const sdk = new CashSDKClient({
+    publishableKey: "csk_pk_example",
+    environment: "sandbox",
+    getSessionToken: async () => `csk_ws_${"a".repeat(43)}`,
+    purchaseStorage: { get: () => null, set: () => {}, remove: () => {} },
+    fetch: async (url, init) => {
+      if (url.endsWith("/customer"))
+        return Response.json({ customerId: "customer_1", environment: "sandbox" });
+      if (!url.endsWith("/checkouts")) throw new Error(`unexpected ${url}`);
+      posted.push({ key: init.headers["Idempotency-Key"], body: JSON.parse(init.body) });
+      await new Promise((resolve) => (release = resolve));
+      return Response.json(
+        {
+          id: "wco_1",
+          provider: "stripe",
+          environment: "sandbox",
+          customerId: "customer_1",
+          status: "requires_action",
+          paymentStatus: null,
+          accessStatus: "check_entitlements",
+          action: { type: "redirect", url: "https://checkout.stripe.com/c/pay/wco_1" },
+          expiresAt: null,
+        },
+        { status: 201 },
+      );
+    },
+  });
+  let hook;
+  function Plans() {
+    hook = usePurchase();
+    return createElement("span", null, `${hook.status}:${String(hook.checkout)}`);
+  }
+  const html = renderToString(
+    createElement(StrictMode, null, createElement(CashSDKProvider, { client: sdk }, createElement(Plans))),
+  );
+  assert.equal(html, "<span>idle:null</span>");
+  assert.equal(posted.length, 0, "rendering buys nothing");
+  const input = { successUrl: "http://localhost:3000/done", cancelUrl: "http://localhost:3000/plans" };
+  const first = hook.start("pkg_monthly", input);
+  assert.equal(hook.start("pkg_monthly", input), first, "a double click joins the running purchase");
+  await assert.rejects(hook.start("pkg_yearly", input), (error) => {
+    assert.equal(error.code, "purchase_in_progress");
+    assert.equal(error.retryable, true);
+    return true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  release();
+  const checkout = await first;
+  assert.equal(checkout.action.url, "https://checkout.stripe.com/c/pay/wco_1");
+  assert.equal(posted.length, 1);
+  assert.deepEqual(posted[0].body, { packageId: "pkg_monthly", ...input });
+  sdk.destroy();
+});
+
+test("hook errors are CashSDKErrors with a code, whatever failed", async () => {
+  const sdk = new CashSDKClient({
+    publishableKey: "csk_pk_example",
+    environment: "sandbox",
+    getSessionToken: async () => {
+      throw new Error("Sign in to continue");
+    },
+  });
+  let checkout;
+  let purchase;
+  let customer;
+  function Page() {
+    checkout = useCheckout();
+    purchase = usePurchase();
+    customer = useCustomer();
+    return null;
+  }
+  renderToString(createElement(CashSDKProvider, { client: sdk }, createElement(Page)));
+  await assert.rejects(
+    checkout.start(
+      { packageId: "package_1", successUrl: "http://localhost:3000/done", cancelUrl: "http://localhost:3000/plans" },
+      { idempotencyKey: "attempt_0123456789abcdef" },
+    ),
+    (error) => error.code === "session_unavailable" && error.message === "Sign in to continue",
+  );
+  await assert.rejects(sdk.initialize(), { code: "session_unavailable" });
+  assert.equal(sdk.getSnapshot().error.code, "session_unavailable");
+  assert.equal(customer.error, null, "rendered before the failure, on the server");
+  await assert.rejects(purchase.start("", { successUrl: "x", cancelUrl: "y" }), { code: "invalid_package" });
+  sdk.destroy();
 });

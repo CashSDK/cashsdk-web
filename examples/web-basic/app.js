@@ -22,22 +22,39 @@ const cashsdk = createCashSDK({
   apiUrl: configuration.apiUrl,
   getSessionToken,
 });
-const attemptPrefix = "cashsdk.example.checkout:";
 const checkoutRows = new Set();
 // The entitlement this example sells. The server checks the same one.
 const entitlement = "pro";
 // One follower per page load. Signing out or loading again ends the previous one.
 let following = new AbortController();
+let signingOut = false;
+let loading = false;
+
+const showSignedOut = (text) => {
+  following.abort();
+  element("account").hidden = true;
+  element("login").hidden = false;
+  checkoutRows.clear();
+  if (text) message(text);
+};
 cashsdk.subscribe(() => {
-  element("access").textContent = JSON.stringify(
-    cashsdk.getSnapshot().entitlements,
-    null,
-    2,
-  );
+  const state = cashsdk.getSnapshot();
+  element("access").textContent = JSON.stringify(state.entitlements, null, 2);
+  if (element("account").hidden || signingOut) return;
+  // Another tab signed out: this one drops the account at once.
+  if (state.status === "signed_out") showSignedOut("Signed out in another tab.");
+  // Another tab signed someone in: load whoever the backend signs in now.
+  else if (state.status === "idle" && !loading)
+    void load().catch(() => showSignedOut("Sign in to load CashSDK access"));
 });
 
 async function load() {
-  await cashsdk.initialize();
+  loading = true;
+  try {
+    await cashsdk.initialize();
+  } finally {
+    loading = false;
+  }
   element("account").hidden = false;
   element("login").hidden = true;
   const offerings = await cashsdk.getOfferings();
@@ -51,43 +68,41 @@ async function load() {
     const label = document.createElement("p");
     label.textContent = `${pkg.product.displayName ?? pkg.identifier}: ${pkg.product.amountMinor ?? "unknown"} minor units ${pkg.product.currency ?? ""}`;
     const button = document.createElement("button");
-    button.textContent = "Start sandbox checkout";
-    const unavailable =
-      !pkg.purchasable ||
-      pkg.product.provider !== "stripe" ||
-      pkg.product.type !== "auto_renewable";
-    button.disabled = unavailable;
     const status = document.createElement("p");
-    const customerId = cashsdk.getSnapshot().customer.customerId;
-    const attemptKey = `${attemptPrefix}${JSON.stringify([configuration.publishableKey, customerId, configuration.connectionId, pkg.id])}`;
-    let attempt = null;
+    // The server says whether this customer can buy it: false once they have the plan.
+    const unavailable = !pkg.purchasable || pkg.product.provider !== "stripe";
     let lastCheckout = null;
-    // An expired or refused attempt is over. The next one is a new purchase, with a new key.
-    const over = (result) => ["expired", "failed"].includes(result?.status);
-    const present = (result) => {
-      lastCheckout = result;
-      status.textContent = `Checkout: ${result.status}; payment: ${result.paymentStatus ?? "pending"}. Access is checked separately.`;
+    const present = (checkout) => {
+      lastCheckout = checkout;
       button.disabled =
-        unavailable || ["complete", "needs_review"].includes(result.status);
-      button.textContent = over(result)
-        ? "Start a new checkout"
-        : result.status === "requires_action"
+        unavailable || ["complete", "needs_review"].includes(checkout?.status);
+      if (!checkout) {
+        status.textContent = "";
+        button.textContent = "Start sandbox checkout";
+        return;
+      }
+      status.textContent = `Checkout: ${checkout.status}; payment: ${checkout.paymentStatus ?? "pending"}. Access is checked separately.`;
+      button.textContent =
+        checkout.status === "requires_action"
           ? "Resume checkout"
-          : "Retry this checkout";
+          : ["expired", "failed"].includes(checkout.status)
+            ? "Start a new checkout"
+            : "Retry this checkout";
     };
+    present(null);
     // After the return from the provider, the payment and then the access arrive on their
     // own. Follow both for a bounded time instead of asking the customer to refresh.
     const follow = async () => {
-      if (!attempt?.id || !lastCheckout) return;
       const open =
-        ["pending", "requires_action"].includes(lastCheckout.status) ||
-        (lastCheckout.status === "complete" &&
+        ["pending", "requires_action"].includes(lastCheckout?.status) ||
+        (lastCheckout?.status === "complete" &&
           lastCheckout.paymentStatus === "unpaid");
       if (!open) return;
-      const outcome = await cashsdk.waitForCheckout(attempt.id, {
+      const outcome = await cashsdk.waitForPurchase(pkg.id, {
         signal,
         timeoutMs: 60000,
       });
+      if (!outcome) return;
       present(outcome.checkout);
       if (!outcome.settled || outcome.checkout.status !== "complete") return;
       message("Payment confirmed. Waiting for access.");
@@ -101,25 +116,9 @@ async function load() {
           : "The payment is confirmed and access has not arrived yet. Refresh access in a moment.",
       );
     };
-    try {
-      const stored = sessionStorage.getItem(attemptKey);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (
-          !/^[A-Za-z0-9_-]{16,128}$/.test(parsed.key) ||
-          (parsed.id && !/^[A-Za-z0-9_-]{1,200}$/.test(parsed.id))
-        )
-          throw new Error("Invalid saved checkout attempt");
-        attempt = parsed;
-      }
-    } catch {
-      button.disabled = true;
-      status.textContent =
-        "Checkout requires readable session storage to preserve its retry key across redirects.";
-    }
-    const refreshCheckout = async () => {
-      if (attempt?.id) present(await cashsdk.getCheckout(attempt.id));
-    };
+    // The customer's attempt for this package, if one is under way. The SDK keeps its key
+    // and checkout id in this tab's sessionStorage, and forgets an attempt once it is over.
+    const refreshCheckout = async () => present(await cashsdk.getPurchase(pkg.id));
     checkoutRows.add(refreshCheckout);
     try {
       await refreshCheckout();
@@ -134,39 +133,26 @@ async function load() {
     button.addEventListener("click", async () => {
       button.disabled = true;
       try {
-        if (
-          lastCheckout?.status === "requires_action" &&
-          lastCheckout.action?.type === "redirect"
-        ) {
-          location.assign(lastCheckout.action.url);
-          return;
-        }
-        if (!attempt || over(lastCheckout))
-          attempt = { key: crypto.randomUUID() };
-        // Persist the operation key before sending. Only operation IDs and retry keys are saved.
-        sessionStorage.setItem(attemptKey, JSON.stringify(attempt));
-        const result = await cashsdk.checkout(
-          {
-            packageId: pkg.id,
-            // Optional: without it CashSDK routes to the app's active connection.
-            ...(configuration.connectionId
-              ? { connectionId: configuration.connectionId }
-              : {}),
-            successUrl: location.origin,
-            cancelUrl: location.origin,
-          },
-          { idempotencyKey: attempt.key },
-        );
-        attempt.id = result.id;
-        sessionStorage.setItem(attemptKey, JSON.stringify(attempt));
-        present(result);
-        if (result.action?.type === "redirect")
-          location.assign(result.action.url);
+        // One key per customer and package, saved before the request: a retry, a lost answer
+        // or a reload is the same purchase. A finished attempt makes room for a new one.
+        const checkout = await cashsdk.purchase(pkg.id, {
+          // Optional: without it CashSDK routes to the app's active connection.
+          ...(configuration.connectionId
+            ? { connectionId: configuration.connectionId }
+            : {}),
+          successUrl: location.origin,
+          cancelUrl: location.origin,
+        });
+        present(checkout);
+        if (checkout.action) location.assign(checkout.action.url);
+        else if (checkout.status === "complete")
+          message("This purchase is complete. Access follows from the payment.");
         else
           message(
-            `Checkout ${result.status}. Retry this same button if the operation is pending.`,
+            `Checkout ${checkout.status}. Retry this same button if the operation is pending.`,
           );
       } catch (error) {
+        // already_subscribed, already_owned and already_purchased: access follows, or is there.
         message(error.message);
       } finally {
         button.disabled =
@@ -216,23 +202,27 @@ element("protected").addEventListener("click", async () => {
   }
 });
 element("logout").addEventListener("click", async () => {
-  try {
-    await cashsdk.logout();
-  } catch {
-    message("Remote revocation was unavailable. Local access was cleared.");
-  } finally {
-    following.abort();
-    element("account").hidden = true;
-    element("login").hidden = false;
-    checkoutRows.clear();
-    try {
-      await fetch("/logout", { method: "POST" });
-    } catch {
-      message(
-        "The backend could not complete sign-out. Retry when it is available.",
-      );
-    }
-  }
+  signingOut = true;
+  // Local access is cleared at once, here and in the customer's other tabs.
+  const { revocation } = await cashsdk.logout();
+  showSignedOut();
+  // The backend's sign-out ends every CashSDK session of the customer. It does not wait for
+  // this tab's own revocation.
+  const [ended, backend] = await Promise.all([
+    revocation,
+    fetch("/logout", { method: "POST" }).then(
+      (response) => response.ok,
+      () => false,
+    ),
+  ]);
+  signingOut = false;
+  message(
+    !backend
+      ? "The backend could not complete sign-out. Retry when it is available."
+      : ended.revoked
+        ? "Signed out."
+        : "Signed out. CashSDK was not reached; the backend ended the session.",
+  );
 });
 try {
   await load();
