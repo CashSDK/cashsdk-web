@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>CashSDK Stripe</title><link rel="stylesheet" href="popup.css"></head>
+<body><main><h1>CashSDK Stripe</h1><p id="origin"></p>
+<details open><summary>Connect your app</summary><form id="setup">
+<label>CashSDK publishable key<input name="publishableKey" required placeholder="csk_pk_…"></label>
+<label>Environment<select name="environment"><option value="sandbox">Sandbox</option><option value="production">Production</option></select></label>
+<label>CashSDK API<input name="apiUrl" type="url" value="https://api.cashsdk.com" required></label>
+<label>Your backend session endpoint<input name="backendSessionURL" type="url" required placeholder="https://your-app.example/api/cashsdk/session"></label>
+<label>Checkout return page<input name="returnURL" type="url" required placeholder="https://your-app.example/billing/return"></label>
+<label>Your signed-in backend session token<input name="backendToken" type="password" required autocomplete="off"></label>
+<button>Connect</button></form></details>
+<p id="status" role="status">Connect your backend to load plans and access.</p><div id="plans"></div>
+<div class="actions"><button id="refresh">Refresh access</button><button id="portal">Manage billing</button><button id="logout">Sign out</button></div>
+<pre id="access"></pre></main><script type="module" src="popup.js"></script></body></html>

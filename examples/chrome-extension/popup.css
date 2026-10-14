@@ -1,0 +1,6 @@
+body { width: 360px; margin: 0; background: #f7faf9; color: #12352c; font: 14px system-ui; }
+main { padding: 20px; } h1 { font-size: 20px; } label { display: block; margin-top: 12px; }
+input, select { box-sizing: border-box; width: 100%; padding: 8px; margin-top: 4px; border: 1px solid #b6c8c1; border-radius: 5px; }
+button { padding: 9px 12px; border: 0; border-radius: 5px; background: #12684d; color: white; cursor: pointer; margin-top: 12px; }
+button:disabled { opacity: .5; cursor: default; } .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+pre, #origin { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; } #status { min-height: 34px; }
